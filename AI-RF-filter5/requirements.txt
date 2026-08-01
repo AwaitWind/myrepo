@@ -1,0 +1,20 @@
+# AI-RF HFSS 滤波器数据集生成 — Python 依赖
+# 安装命令：pip install -r requirements.txt
+# 建议使用 Python 3.10（与 ansys-aedt-core 0.7+/pyansys 环境兼容）
+
+# 数值与科学计算
+numpy>=1.24,<2.1
+scipy>=1.11,<1.14
+
+# 可视化（HFSS 仿真结果对比图、S 参数曲线）
+matplotlib>=3.7,<3.10
+
+# 射频/微波网络分析：Touchstone (.sNp) 解析、Smith 圆图、群时延、级联
+scikit-rf>=0.29,<1.0
+
+# Ansys AEDT Python 绑定（PyAEDT），需匹配本机 AEDT 版本
+# 项目中使用 AEDT 2023.1；AEDT 2023.1 对应 pyaedt>=0.6.74
+pyaedt
+
+# 进程管理（main.py 中清理 ansysedt 僵尸进程时用到）
+psutil>=5.9,<6.2

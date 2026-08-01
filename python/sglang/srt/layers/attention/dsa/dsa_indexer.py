@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -1246,49 +1247,32 @@ class Indexer(MultiPlatformOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
+        kv_pool = get_token_to_kv_pool()
+        page_size = kv_pool.page_size
+
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
-            and can_use_dsa_fused_store(
-                key.dtype,
-                out_cache_loc.dtype,
-                get_token_to_kv_pool().page_size,
-            )
+            and can_use_dsa_fused_store(key.dtype, out_cache_loc.dtype, page_size)
         ):
-            # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
-            fused_store_index_k_cache(
-                key,
-                buf,
-                out_cache_loc,
-                get_token_to_kv_pool().page_size,
-            )
+            buf = kv_pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            fused_store_index_k_cache(key, buf, out_cache_loc, page_size)
+            # PIC: also write computed DSA K to public slots for miss segments
+            self._pic_writeback_dsa_k(forward_batch, key, buf, page_size, act_quant)
             return
 
-        # Fast path: AITER fused quant + cache store
-        # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
-        # layout (page_size>=16). Otherwise we fall back to the legacy row-major
-        # layout with page_size=1; the same kv_cache.view works for both cases
-        # because page_size is 1 there.
         if _use_aiter:
-            page_size = get_token_to_kv_pool().page_size
-            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = kv_pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
-                key,
-                kv_cache,
-                out_loc,
-                self.block_size,
-                self.scale_fmt,
+                key, kv_cache, out_loc,
+                self.block_size, self.scale_fmt,
                 preshuffle=_use_aiter_preshuffle,
             )
+            self._pic_writeback_dsa_k(forward_batch, key, buf, page_size, act_quant)
             return
 
         # Fallback: original path
@@ -1298,12 +1282,70 @@ class Indexer(MultiPlatformOp):
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()
 
-        get_token_to_kv_pool().set_index_k_scale_buffer(
+        kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=out_cache_loc,
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
+        self._pic_writeback_dsa_k(forward_batch, key, None, page_size, act_quant)
+
+    def _pic_writeback_dsa_k(
+        self,
+        forward_batch: ForwardBatch,
+        key: torch.Tensor,
+        buf,          # index_k_with_scale_buffer (None triggers fallback path)
+        page_size: int,
+        act_quant,
+    ) -> None:
+        """Write DSA index-K to public slots for PIC miss-segment tokens.
+
+        Skips unless forward_batch.pic_public_out_loc is set and has valid entries.
+        Only miss-segment positions have pic_public_out_loc >= 0; hit-segment
+        positions and non-PIC tokens are -1 and are ignored.
+        """
+        pub_loc = getattr(forward_batch, "pic_public_out_loc", None)
+        if pub_loc is None:
+            return
+
+        # Ensure pub_loc matches key's first dimension.  They may differ when
+        # attn_tp_scatter pads the hidden states (and thus key) to a multiple of
+        # tp_size while pic_public_out_loc was built from unpadded miss tokens.
+        n = key.shape[0]
+        if pub_loc.shape[0] != n:
+            if pub_loc.shape[0] > n:
+                pub_loc = pub_loc[:n]
+            else:
+                pad = torch.full(
+                    (n - pub_loc.shape[0],), -1,
+                    dtype=pub_loc.dtype, device=pub_loc.device,
+                )
+                pub_loc = torch.cat([pub_loc, pad])
+
+        valid = pub_loc >= 0
+        if not valid.any():
+            return
+
+        pub_slots = pub_loc[valid]
+        pub_key = key[valid].contiguous()
+
+        if buf is not None and _is_cuda and not _is_fp8_fnuz:
+            fused_store_index_k_cache(pub_key, buf, pub_slots, page_size)
+        elif _use_aiter and buf is not None:
+            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
+            indexer_k_quant_and_cache(
+                pub_key, kv_cache, pub_slots,
+                self.block_size, self.scale_fmt,
+                preshuffle=_use_aiter_preshuffle,
+            )
+        elif act_quant is not None:
+            k_fp8, k_scale = act_quant(pub_key, self.block_size, self.scale_fmt)
+            get_token_to_kv_pool().set_index_k_scale_buffer(
+                layer_id=0,  # layer_id not available here; caller should pass if needed
+                loc=pub_slots,
+                index_k=k_fp8,
+                index_k_scale=k_scale,
+            )
 
     def forward_xpu(
         self,
@@ -1356,7 +1398,7 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
-        # Determine if should skip topk based on sequence length
+        # Determine if should skip topk based on sequence length or MHA path
         # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
         if (
@@ -1366,6 +1408,17 @@ class Indexer(MultiPlatformOp):
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
+            # Widened gate: when the backend has selected the MHA_ONE_SHOT
+            # dense path (`use_mha=True`), `_forward_standard_mha` reads
+            # q/k/v directly via `flash_attn_varlen_func` / trtllm-ragged and
+            # NEVER consumes `topk_indices`. Skip the index_score GEMM +
+            # top-k entirely; `_forward_cuda_k_only` still writes index-K to
+            # the pool so subsequent decode (which always uses DSA sparse)
+            # sees the correct index-K at these positions.
+            if not skip_logits_computation:
+                _backend = get_attn_backend()
+                if getattr(_backend, "use_mha", False):
+                    skip_logits_computation = True
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):

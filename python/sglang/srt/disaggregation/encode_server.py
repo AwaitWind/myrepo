@@ -60,7 +60,7 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
-from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
+from sglang.srt.utils.common import configure_logger
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -2979,9 +2979,6 @@ async def run_dp_worker(
         f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')})"
     )
 
-    # gpu_id is the device chosen by maybe_reindex_device_id in the parent:
-    # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
-    # MMEncoder runs set_device(base_gpu_id).
     args = copy.deepcopy(server_args)
     args.base_gpu_id = gpu_id
     args.tp_size = 1
@@ -3312,24 +3309,18 @@ def _launch_server_dp(server_args: ServerArgs):
 
     for dp_rank in range(dp_size):
         gpu_id = server_args.base_gpu_id + dp_rank
-        # Pin the device parent-side around spawn (same convention as the
-        # scheduler launcher and DP controller) so the child inherits
-        # CUDA_VISIBLE_DEVICES from its first instruction, before any import
-        # can enumerate CUDA. No-op unless SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS
-        # is set, in which case gpu_id is reindexed to 0 and CVD is pinned.
-        with maybe_reindex_device_id(gpu_id) as gpu_id:
-            proc = ctx.Process(
-                target=launch_dp_worker,
-                args=(
-                    server_args,
-                    dp_rank,
-                    gpu_id,
-                    f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
-                    result_path,
-                ),
-                daemon=False,
-            )
-            proc.start()
+        proc = ctx.Process(
+            target=launch_dp_worker,
+            args=(
+                server_args,
+                dp_rank,
+                gpu_id,
+                f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
+                result_path,
+            ),
+            daemon=False,
+        )
+        proc.start()
         worker_processes.append(proc)
 
     dp_dispatcher = DPDispatcher(

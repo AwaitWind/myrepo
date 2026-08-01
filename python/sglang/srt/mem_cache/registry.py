@@ -42,6 +42,7 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
+    dsa_state_pool: Optional[Any] = None  # GLM5.2: DSAStatePool for PIC
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -78,6 +79,33 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
     server_args = ctx.server_args
     params = ctx.params
+
+    # PIC (Position-Independent Cache) for GLM5.2 segment-level KV caching
+    if server_args.pic_enable:
+        from sglang.srt.pic.picache import PICache
+
+        dsa_state_pool = getattr(ctx, "dsa_state_pool", None)
+
+        logger.info(
+            "PIC enabled: separator=%s dsa=%s",
+            server_args.pic_separator_str,
+            dsa_state_pool is not None,
+        )
+        return PICache(
+            req_to_token_pool=params.req_to_token_pool,
+            token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+            dsa_state_pool=dsa_state_pool,
+            page_size=params.page_size,
+            # PIC is opt-in via --pic-enable; if the user turned it on, honor
+            # it regardless of --disable-radix-cache. params.disable is fed
+            # from disable_radix_cache in kv_cache_builder.py; without this
+            # override, --disable-radix-cache silently kills PIC's match_prefix
+            # and pic_alloc crashes with "segment is neither hit nor miss".
+            # Required for the --pic-enable + --enable-a3/--enable-cacheblend
+            # combo (A3 mandates --disable-radix-cache).
+            disable=False,
+            enable_metrics=params.enable_metrics,
+        )
 
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
         if not ctx.is_hybrid_swa:

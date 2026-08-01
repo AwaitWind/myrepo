@@ -284,6 +284,17 @@ class GenerateReqInput(BaseReq):
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # ===== A³ / CacheBlend selective-recompute (GLM-5.2 target) =====
+    # Baseline supports single-request extend only. Fields are scalar (not batched):
+    # a batched request that sets these will apply the same values to every sub-req.
+    # reuse_method: 'debug' (A³) or 'blend' (CacheBlend). None = feature disabled.
+    reuse_method: Optional[str] = None
+    recomp_ratio: Optional[float] = None
+    reuse_last_len: Optional[int] = None
+    reuse_prefix_len: Optional[int] = None
+    # Path to precomputed KV .pt file (see scripts/precompute_kv_mla.py).
+    precomputed_kv_path: Optional[str] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -727,6 +738,12 @@ class GenerateReqInput(BaseReq):
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            # A³ / CacheBlend: scalar (not batched) — propagate identically to each sub-req.
+            reuse_method=self.reuse_method,
+            recomp_ratio=self.recomp_ratio,
+            reuse_last_len=self.reuse_last_len,
+            reuse_prefix_len=self.reuse_prefix_len,
+            precomputed_kv_path=self.precomputed_kv_path,
         )
         cache[i] = sub
         return sub
@@ -828,6 +845,13 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+
+    # ===== A³ / CacheBlend selective-recompute (see GenerateReqInput) =====
+    reuse_method: Optional[str] = None
+    recomp_ratio: Optional[float] = None
+    reuse_last_len: Optional[int] = None
+    reuse_prefix_len: Optional[int] = None
+    precomputed_kv_path: Optional[str] = None
 
 
 @dataclass

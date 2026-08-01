@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -226,6 +228,31 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
     )
 
+    # GLM5.2 PIC: create DSAStatePool if PIC is enabled
+    dsa_state_pool = None
+    if server_args.pic_enable:
+        from sglang.srt.pic.pic_alloc import DSAStatePool
+
+        # Determine DSA config from model config
+        # For GLM5.2, these should come from the model's configuration
+        num_dsa_layers = getattr(model_config, "num_dsa_layers", 0)
+        dsa_state_shape = getattr(model_config, "dsa_state_shape", (8, 64))
+        dsa_dtype = getattr(model_config, "dsa_dtype", torch.float32)
+        device = req_to_token_pool.device
+
+        if num_dsa_layers > 0:
+            dsa_state_pool = DSAStatePool(
+                num_dsa_layers=num_dsa_layers,
+                pool_size=server_args.mamba_ssm_cache_size or 1024,
+                dsa_state_shape=dsa_state_shape,
+                dsa_dtype=dsa_dtype,
+                device=device,
+            )
+            logger.info(
+                "DSAStatePool created: num_layers=%d pool_size=%d shape=%s",
+                num_dsa_layers, dsa_state_pool.pool_size, dsa_state_shape,
+            )
+
     tree_cache = create_tree_cache(
         TreeCacheBuildContext(
             server_args=server_args,
@@ -240,6 +267,7 @@ def build_kv_cache(
             tp_size=ps.tp_size,
             tp_rank=ps.tp_rank,
             tp_group=tp_group,
+            dsa_state_pool=dsa_state_pool,
         )
     )
 

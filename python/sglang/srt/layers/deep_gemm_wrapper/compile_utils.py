@@ -32,6 +32,7 @@ _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
+_FAST_WARMUP_STRIDE_MULT = max(1, envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP_STRIDE_MULT.get())
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -57,15 +58,21 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         # First cover all the small bs to ensure decode performance
         _BUILTIN_M_LIST += list(range(1, 1025))
 
-        # Then cover larger batch sizes with gradually increasing steps
-        # For example, when chunekd prefill size is 16384
-        # The sampled Ms would be:
+        # Then cover larger batch sizes with gradually increasing steps.
+        # sample_step is initialized to 2 and multiplied by
+        # _FAST_WARMUP_STRIDE_MULT to let callers trade first-hit JIT latency
+        # for shorter startup (set to 4/8 to halve/quarter the mid/high-M band).
+        # For example, when chunked prefill size is 16384 and stride_mult=1
+        # (default), the sampled Ms would be:
         #   1024, 1026, ... 2046 (step 2)
         #   2048, 2052, ... 4092 (step 4)
         #   4096, 5004, ... 8184 (step 8)
         #   8192, 9008, ... 16384 (step 16)
-        # Totally 1024 + 1024 / 2 + 2048 / 4 + 4096 / 8 + 8192 / 16 = 3072 kernels
-        next_m, sample_step = 1024, 2
+        # Totally 1024 + 1024 / 2 + 2048 / 4 + 4096 / 8 + 8192 / 16 = 3072 kernels.
+        # With stride_mult=4 the per-band count drops to 256 (~1281 total),
+        # trimming several seconds off startup for shape-heavy setups
+        # (e.g. --pic-enable + --enable-a3, which forces extra num_splits shapes).
+        next_m, sample_step = 1024, 2 * _FAST_WARMUP_STRIDE_MULT
         max_prefill_bs = (
             min(server_args.chunked_prefill_size, 32 * 1024)
             if server_args.chunked_prefill_size >= 1

@@ -100,7 +100,6 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
-    maybe_reindex_device_id,
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -623,27 +622,26 @@ class Engine(EngineScoreMixin, EngineBase):
                         server_args, tp_rank
                     )
 
-                    with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
-                                server_args,
-                                port_args,
-                                gpu_id,
-                                tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
-                                pp_rank,
-                                None,
-                                writer,
-                            ),
-                        )
-                        with (
-                            memory_saver_adapter.configure_subprocess(),
-                            numa_utils.configure_subprocess(server_args, gpu_id),
-                        ):
-                            proc.start()
+                    proc = mp.Process(
+                        target=run_scheduler_process_func,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
+                    with (
+                        memory_saver_adapter.configure_subprocess(),
+                        numa_utils.configure_subprocess(server_args, gpu_id),
+                    ):
+                        proc.start()
 
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)

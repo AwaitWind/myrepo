@@ -918,8 +918,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+
+        # PIC: split text into segments for GLM5.2 segment-level caching
+        pic_segments = None
+        if (
+            self.server_args.pic_enable
+            and input_text is not None
+            and obj.input_ids is None
+            and not should_run_mm_processor
+        ):
+            from sglang.srt.pic.segmenter import split_and_tokenize
+
+            pic_input_ids, pic_segments = split_and_tokenize(
+                input_text,
+                self.tokenizer,
+                separator=self.server_args.pic_separator_str,
+                sink_len=self.server_args.pic_sink_len,
+                sink_token_id=self.server_args.pic_sink_token_id,
+            )
+            if pic_segments and len(pic_segments) > 1:
+                input_ids = pic_input_ids
+                logger.debug(
+                    "PIC split: %d segments for rid=%s",
+                    len(pic_segments), getattr(obj, "rid", "?"),
+                )
+
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids,
+            pic_segments=pic_segments,
         )
 
     def _validate_one_request(
@@ -1073,6 +1099,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
+        pic_segments: Optional[List[Tuple[int, int]]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         input_ids_arr: Optional[array[int]] = (
@@ -1139,6 +1166,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                # A³ / CacheBlend selective-recompute fields (None on default path).
+                reuse_method=obj.reuse_method,
+                recomp_ratio=obj.recomp_ratio,
+                reuse_last_len=obj.reuse_last_len,
+                reuse_prefix_len=obj.reuse_prefix_len,
+                precomputed_kv_path=obj.precomputed_kv_path,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1170,6 +1203,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+
+        # PIC: attach segment info to the tokenized object
+        if pic_segments is not None and len(pic_segments) > 1:
+            tokenized_obj.pic_segments = pic_segments
 
         return tokenized_obj
 

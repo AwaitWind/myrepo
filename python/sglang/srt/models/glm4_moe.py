@@ -343,6 +343,26 @@ class Glm4MoeAttention(nn.Module):
                 k_bias=k_bias,
             )
 
+        # ── A³ / CacheBlend: stash 4D QKV between prepare and core ──
+        # Only active when the state machine has entered checking/postchecking
+        # AND we're in extend (prefill). Zero overhead on the default path.
+        if (
+            forward_batch.reuse_method is not None
+            and forward_batch.reuse_check_state in ("checking", "postchecking")
+            and forward_batch.forward_mode.is_extend()
+        ):
+            seq_len = q.shape[0]
+            q_4d = q.view(1, seq_len, self.num_heads, self.head_dim).permute(
+                0, 2, 1, 3
+            )
+            k_4d = k.view(1, seq_len, self.num_kv_heads, self.head_dim).permute(
+                0, 2, 1, 3
+            )
+            v_4d = v.view(1, seq_len, self.num_kv_heads, self.head_dim).permute(
+                0, 2, 1, 3
+            )
+            forward_batch.reuse_qkv_checking = (q_4d, k_4d, v_4d)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -350,9 +370,115 @@ class Glm4MoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+
+        # ── A³ / CacheBlend reuse path: branch on reuse_check_state ──
+        if (
+            forward_batch.reuse_method is not None
+            and forward_batch.reuse_check_state in ("checking", "postchecking")
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.reuse_qkv_checking is not None
+        ):
+            return self._reuse_forward_core(inner_state, forward_batch)
+
         attn_output = self.attn(*inner_state)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _reuse_forward_core(
+        self,
+        inner_state,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """A³ / CacheBlend attention path (single-request extend only).
+
+        checking       -> pick imp_indices, run Q_imp @ KV_full (no fusion).
+        postchecking   -> fuse new KV into precomputed KV at imp_indices,
+                          run Q_imp @ KV_fused.
+        """
+        from sglang.srt.models.reuse_utils import (
+            align_precomputed_key_rope,
+            compute_prefill_attention_with_custom_kv,
+            get_topindices,
+        )
+
+        _, _, _, _ = inner_state
+        q_4d, k_4d, v_4d = forward_batch.reuse_qkv_checking
+        # Clear so a subsequent layer must re-populate — protects against stale reuse.
+        forward_batch.reuse_qkv_checking = None
+
+        cat_kv = forward_batch.reuse_cat_kv_cur_layer  # (2, kv_heads, total_len, dim)
+        org_pos = forward_batch.reuse_org_positions  # (total_len,)
+        total_len = org_pos.shape[0]
+
+        key_old_4d = cat_kv[0].unsqueeze(0)  # (1, kv_heads, total_len, head_dim)
+        value_old_4d = cat_kv[1].unsqueeze(0)
+
+        # Lazy init fake_q used to drive rotary_emb for old-K alignment.
+        if forward_batch.reuse_fake_q is None:
+            forward_batch.reuse_fake_q = torch.zeros(
+                (total_len, self.num_heads * self.head_dim),
+                dtype=q_4d.dtype,
+                device=q_4d.device,
+            )
+
+        key_old_4d = align_precomputed_key_rope(
+            rotary_emb=self.rotary_emb,
+            org_positions=org_pos,
+            key_old_4d=key_old_4d,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            fake_q_flat=forward_batch.reuse_fake_q,
+        )
+
+        num_kv_groups = self.num_heads // self.num_kv_heads
+
+        if forward_batch.reuse_check_state == "checking":
+            reuse_config = {
+                "reuse": forward_batch.reuse_method,
+                "recomp_ratio": forward_batch.recomp_ratio,
+                "last_len": forward_batch.reuse_last_len,
+                "prefix_len": forward_batch.reuse_prefix_len,
+            }
+            imp_indices = get_topindices(
+                reuse_config=reuse_config,
+                query_states=q_4d,
+                key_states=k_4d,
+                value_states=v_4d,
+                value_old=value_old_4d,
+                num_key_value_groups=num_kv_groups,
+            )
+            forward_batch.reuse_imp_indices = imp_indices
+
+            q_4d_imp = q_4d[:, :, imp_indices, :]
+            attn_output_flat = compute_prefill_attention_with_custom_kv(
+                q=q_4d_imp,
+                k=k_4d,
+                v=v_4d,
+                num_kv_groups=num_kv_groups,
+                scale=self.scaling,
+                imp_indices=imp_indices,
+                total_len=total_len,
+            )
+        else:
+            # postchecking: KV fusion — new K/V at imp_indices, precomputed elsewhere.
+            imp_indices = forward_batch.reuse_imp_indices
+            key_fused = key_old_4d.clone()
+            value_fused = value_old_4d.clone()
+            key_fused[:, :, imp_indices, :] = k_4d
+            value_fused[:, :, imp_indices, :] = v_4d
+            attn_output_flat = compute_prefill_attention_with_custom_kv(
+                q=q_4d,
+                k=key_fused,
+                v=value_fused,
+                num_kv_groups=num_kv_groups,
+                scale=self.scaling,
+                imp_indices=imp_indices,
+                total_len=total_len,
+            )
+
+        output, _ = self.o_proj(attn_output_flat)
+        return output
+
 
     def forward(
         self,
@@ -955,6 +1081,20 @@ class Glm4MoeDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
+        # ── A³ / CacheBlend: on the checking layer, hidden_states was clipped
+        # from (total_len, dim) to (imp_len, dim); residual must be clipped too
+        # so the post-attn residual add (inside prepare_mlp) has matching shapes.
+        # postchecking layers already receive (imp_len, dim) residual from the
+        # previous layer's output — no further clip needed there.
+        if (
+            forward_batch.reuse_method is not None
+            and forward_batch.reuse_check_state == "checking"
+            and forward_batch.reuse_imp_indices is not None
+            and residual is not None
+            and residual.shape[0] != hidden_states.shape[0]
+        ):
+            residual = residual[forward_batch.reuse_imp_indices, :]
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -1113,9 +1253,27 @@ class Glm4MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # ── A³ / CacheBlend: initialize reuse state machine ──
+        # Active iff: reuse_method set on ForwardBatch, extend mode, precomputed_kv present.
+        is_reuse_active = (
+            forward_batch.reuse_method is not None
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.precomputed_kv is not None
+        )
+        if is_reuse_active:
+            from sglang.srt.models.reuse_utils import CHECK_LAYER as _reuse_check_layer
+
+            forward_batch.reuse_org_positions = positions.clone()
+            forward_batch.reuse_check_state = None
+            forward_batch.reuse_imp_indices = None
+            forward_batch.reuse_fake_q = None
+            forward_batch.reuse_qkv_checking = None
+        else:
+            _reuse_check_layer = -1  # sentinel; never matched
+
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and not is_reuse_active:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -1129,6 +1287,19 @@ class Glm4MoeModel(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
+
+                # ── State machine transition for this layer ──
+                if is_reuse_active:
+                    forward_batch.reuse_cat_kv_cur_layer = (
+                        forward_batch.precomputed_kv[:, i, :, :, :]
+                    )
+                    if i == _reuse_check_layer:
+                        forward_batch.reuse_check_state = "checking"
+                    elif i > _reuse_check_layer:
+                        forward_batch.reuse_check_state = "postchecking"
+                    else:
+                        forward_batch.reuse_check_state = None
+
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -1136,6 +1307,17 @@ class Glm4MoeModel(nn.Module):
                     forward_batch,
                     residual,
                 )
+
+                # After the checking layer, positions collapse to imp_indices so
+                # every subsequent layer's partial-RoPE uses the correct positions.
+                if (
+                    is_reuse_active
+                    and i == _reuse_check_layer
+                    and forward_batch.reuse_imp_indices is not None
+                ):
+                    positions = forward_batch.reuse_org_positions[
+                        forward_batch.reuse_imp_indices
+                    ]
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

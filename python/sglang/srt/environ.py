@@ -346,7 +346,6 @@ class Envs:
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
-    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
@@ -536,6 +535,12 @@ class Envs:
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
+    # Coarser sampling on top of FAST_WARMUP: multiplies the prefill M sample_step.
+    # 1 (default) preserves the legacy fast-warmup list (~3072 Ms). Values >1 shrink
+    # the mid/high-M band linearly (e.g. 4 → ~1281 Ms, 8 → ~1153). Decode range
+    # (1..1024) is always fully covered. Set >1 when startup latency dominates and
+    # you accept a first-hit JIT compile for uncovered Ms.
+    SGLANG_JIT_DEEPGEMM_FAST_WARMUP_STRIDE_MULT = EnvInt(1)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
@@ -578,6 +583,44 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+
+    # PIC A3 / CacheBlend
+    # Restrict layer-1 imp topk to hit segments only. Miss segments are always
+    # recomputed at layer 2+, so letting them compete for imp slots wastes the
+    # budget and can starve hit segments. When on: for each hit segment pick
+    # top ceil(seg_len * recomp_ratio) tokens (page-aligned to 64) by attention
+    # mass from the query region. Softmax denominator stays full-context; only
+    # the topk index set is restricted.
+    SGLANG_PIC_A3_HIT_ONLY_IMP = EnvBool(False)
+
+    # Hybrid imp budget (pic_a3_oracle scale-robustness, 2026-07-24): GLOBAL
+    # top-k imp at the first check layer (layer 1) — concentrates recompute on
+    # the answer-relevant chunk, best for the single-layer pick — but PER-SEGMENT
+    # budget at the DEEP reselect layers (20/40/60) — where a distractor pool
+    # otherwise starves the answer chunk of the global budget and collapses the
+    # oracle at scale. Combines pic_a3's layer-1 concentration with the oracle's
+    # deep-layer starvation resistance. Default off.
+    SGLANG_PIC_A3_HYBRID_IMP = EnvBool(False)
+
+    # Oracle-guided multi-layer reselect (pic_a3_oracle), fully in-process.
+    # Requires Phase B keepalive (SGLANG_PIC_A3_KEEP_ALIVE=1) + multi-layer
+    # --a3-check-layers. When on: at each check layer the model captures the
+    # per-segment INPUT hidden state (residual stream) the FIRST time a segment
+    # is computed fresh (the isolated warmup pass), keyed by PIC segment hash;
+    # on a later request that hits the segment, it INJECTS the stored isolated
+    # hidden as that segment's layer input so the layer's own attention re-picks
+    # imp (re-selection) and recomputes imp KV from accurate (undrifted) input.
+    # No separate capture server / files — capture + inject happen in the same
+    # server across warmup → measure. Off (False) = plain Phase B keepalive.
+    SGLANG_PIC_A3_ORACLE = EnvBool(False)
+
+    # pic_a3_oracle Route-A clip: replace full-length keepalive with per-check-
+    # layer clip to (miss ∪ imp'). The rows dropped by a previous window but re-
+    # selected by this one have no in-context hidden (broken residual chain), so
+    # they are refilled from the oracle capture (self._pic_a3_oracle_hidden).
+    # Requires SGLANG_PIC_A3_KEEP_ALIVE + SGLANG_PIC_A3_ORACLE + multi check
+    # layers. Off (False) = existing full-length keepalive (zero regression).
+    SGLANG_PIC_A3_CLIP_CAPTURE = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

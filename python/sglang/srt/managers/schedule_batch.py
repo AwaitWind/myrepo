@@ -988,6 +988,72 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # PIC (Position-Independent Cache) fields — transition_rope mode
+        self.pic_segments: Optional[List[Tuple[int, int]]] = None
+        self.pic_hit_segments: List[Tuple[int, int, bytes]] = []
+        self.pic_miss_segments: List[Tuple[int, int]] = []
+        self.pic_segment_entries: Dict[bytes, Any] = {}
+        # Populated by _pic_alloc_transition_rope in pic_alloc.py:
+        self.pic_miss_segment_slots: Dict[Tuple[int, int], tuple] = {}
+        self.pic_rope_hit_private_slots: Dict[Tuple[int, int], tuple] = {}  # (priv, pub, old_start)
+        # Populated by PICache.cache_unfinished_req:
+        self._pic_cached_segments: set = set()
+        # pic_mode: dispatch tag for the three PIC forward paths.
+        #   None            — non-PIC request
+        #   "pic"           — plain PIC: hit tokens skip forward, K/V pre-populated
+        #   "pic_a3"        — PIC + A³ recompute: ALL tokens go through forward,
+        #                     layer 1 picks imp via Q·K, layer 2+ K-overrides
+        #                     non-imp hit positions, imp positions stay fresh
+        #   "pic_cacheblend"— PIC + CacheBlend recompute: same as pic_a3, but
+        #                     layer 1 picks imp via V-diff instead of Q·K
+        # Set in scheduler.handle_generate_request from server_args.
+        self.pic_mode: Optional[str] = None
+
+        # ===== A³ / CacheBlend selective-recompute (opt-in) =====
+        # If reuse_method is set AND a precomputed_kv is provided (either as a
+        # tensor/dict or a .pt file path), the model's reuse state machine runs.
+        # For MLA/DSA (GLM-5.2), precomputed_kv is a dict:
+        #   {'latent': (num_layers, total_len, kv_lora_rank + qk_rope_head_dim),
+        #    'index_k': (num_layers, total_len, index_head_dim) or None}
+        # For standard MHA (glm4_moe), precomputed_kv is a single tensor
+        #   (2, num_layers, num_kv_heads_per_tp, total_len, head_dim).
+        # Default None = feature disabled.
+        self.reuse_method: Optional[str] = None  # 'debug' (A³) / 'blend' (CacheBlend)
+        self.recomp_ratio: float = 0.15
+        self.reuse_last_len: Optional[int] = None
+        self.reuse_prefix_len: int = 0
+        self.precomputed_kv_path: Optional[str] = None
+        self.precomputed_kv: Optional[Any] = None  # torch.Tensor OR Dict[str, torch.Tensor]
+
+    def get_precomputed_kv(self, device: str = "cuda", tp_rank: int = 0):
+        """Lazy-load precomputed KV cache from disk if a path is set.
+
+        If ``precomputed_kv_path`` contains the ``{rank}`` template, it is
+        substituted with ``tp_rank`` before loading — this lets multi-TP
+        precompute (scripts/precompute_kv_mla.py, which emits rank0.pt /
+        rank1.pt / ...) work per-rank without a central config change.
+
+        Returns:
+            - For MLA/DSA (dict form): {'latent': tensor, 'index_k': tensor|None, ...}
+            - For MHA (tensor form): torch.Tensor
+            - None if no path/data.
+        """
+        if self.precomputed_kv is not None:
+            return self.precomputed_kv
+        if self.precomputed_kv_path is not None:
+            path = self.precomputed_kv_path
+            if "{rank}" in path:
+                path = path.format(rank=tp_rank)
+            loaded = torch.load(path, map_location=device)
+            # Normalize legacy tensor form → dict for MLA callers that always
+            # expect dict; MHA callers still work with the raw tensor.
+            if isinstance(loaded, torch.Tensor):
+                # Wrap in dict but keep the tensor field for MHA path compatibility.
+                self.precomputed_kv = loaded
+            else:
+                self.precomputed_kv = loaded  # dict already
+        return self.precomputed_kv
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1143,6 +1209,31 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+
+            # PIC: handle segment-level match results
+            if (
+                match_result.pic_segment_entries is not None
+                and self.pic_segments is not None
+            ):
+                self.pic_segment_entries = {
+                    e.seg_hash: e
+                    for e in match_result.pic_segment_entries
+                    if e is not None
+                }
+                self.pic_hit_segments = [
+                    (start, end, e.seg_hash)
+                    for (start, end), e in zip(
+                        self.pic_segments, match_result.pic_segment_entries
+                    )
+                    if e is not None
+                ]
+                self.pic_miss_segments = [
+                    (start, end)
+                    for (start, end), e in zip(
+                        self.pic_segments, match_result.pic_segment_entries
+                    )
+                    if e is None
+                ]
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1689,6 +1780,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_sum: int = None
     extend_num_tokens: Optional[int] = None
 
+    # PIC: public slot locations for post-forward KV writeback.
+    # Same shape as out_cache_loc; >= 0 only for miss-segment token positions.
+    # Set by pic_alloc_for_extend, consumed by model_runner._pic_writeback_public.
+    pic_public_out_loc: Optional[torch.Tensor] = None
+
+    # PIC: hit-segment delta-RoPE metadata for forward_absorb_prepare fallback.
+    pic_hit_pub_kv_loc: Optional[torch.Tensor] = None
+    pic_hit_delta_pos: Optional[torch.Tensor] = None
+
+    # PIC: actual miss-token sequence positions (non-contiguous) to override
+    # the standard sequential positions in ForwardBatch for correct RoPE.
+    pic_miss_positions: Optional[torch.Tensor] = None
+
+    # PIC: flat hit-slot tensors for _pic_prepopulate_hit_slots in model_runner.
+    pic_all_hit_pub_slots: Optional[torch.Tensor] = None
+    pic_all_hit_priv_slots: Optional[torch.Tensor] = None
+    pic_all_hit_delta_pos: Optional[torch.Tensor] = None
+
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
@@ -1902,12 +2011,98 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        # For PIC requests: input_ids = miss segment tokens only (real compute savings).
+        # For non-PIC requests: same as before (all extend tokens).
+        _use_pic_batch = use_pic if "use_pic" in dir() else False
+
+        # imp-only pre-pass: compute per-hit-segment imp positions once per req,
+        # BEFORE input_ids / hit_pub builders run. See plan file
+        # encapsulated-foraging-lamport.md. Kept as a top-level attr on Req
+        # so both this method and pic_alloc.py read the same mapping.
+        for _r in reqs:
+            # Always define the attr so downstream code can just read it.
+            if not hasattr(_r, "pic_hit_imp_flat"):
+                _r.pic_hit_imp_flat = set()
+            if not hasattr(_r, "pic_hit_imp_per_seg"):
+                _r.pic_hit_imp_per_seg = {}
+
+        def _is_pic_a3_new_path(r) -> bool:
+            """pic_a3/pic_cacheblend new path: fresh-recompute layer 0-1 with
+            full-length input, no .pt precomputed_kv. See
+            scripts/pic_a3_full_recompute_plan.md §3.9.
+            """
+            return (
+                getattr(r, "pic_mode", None) in ("pic_a3", "pic_cacheblend")
+                and getattr(r, "precomputed_kv_path", None) is None
+                and getattr(r, "pic_hit_segments", None)
+            )
+
+        def _build_input_ids_and_miss_positions():
+            ids_list = []
+            miss_pos_list = []
+            # For pic_a3 new-path: per-req miss/hit position tracking so
+            # we can later build pic_a3_is_hit_mask/hit_pub_slots parallel
+            # to input_ids (see below the pic_alloc call).
+            pic_a3_per_req_positions: List[dict] = []
+            for r in reqs:
+                if getattr(r, "pic_segments", None):
+                    fill = r.get_fill_ids()
+                    r_ids, r_pos = array("q"), []
+                    _r_info = None
+                    if _is_pic_a3_new_path(r):
+                        # pic_a3 new-path: include ALL tokens (hit + miss)
+                        # in position order. Plan §3.6: layer 0-1 processes
+                        # the full sequence with fresh KV to scratch slots.
+                        miss_set = set(r.pic_miss_segments)
+                        _hit_positions_local: list = []
+                        _miss_positions_local: list = []
+                        for (s, e) in r.pic_segments:
+                            r_ids.extend(fill[s:e])
+                            if (s, e) in miss_set:
+                                _miss_positions_local.extend(range(s, e))
+                            else:
+                                _hit_positions_local.extend(range(s, e))
+                        # miss_pos_list only accumulates miss (used elsewhere)
+                        r_pos.extend(_miss_positions_local)
+                        _r_info = {
+                            "mode": "pic_a3_new_path",
+                            "hit_positions": _hit_positions_local,
+                            "miss_positions": _miss_positions_local,
+                            "full_len": len(fill),
+                        }
+                    else:
+                        # PIC (legacy): only miss segments enter the forward.
+                        # Hit segments have K/V pre-populated by
+                        # _pic_prepopulate_hit_slots before forward.
+                        for (s, e) in r.pic_segments:
+                            if (s, e) in set(r.pic_miss_segments):
+                                r_ids.extend(fill[s:e])
+                                r_pos.extend(range(s, e))
+                        _r_info = {"mode": "pic_legacy"}
+                    ids_list.append(r_ids)
+                    miss_pos_list.extend(r_pos)
+                    pic_a3_per_req_positions.append(_r_info)
+                else:
+                    ids_list.append(r.get_fill_ids()[len(r.prefix_indices):])
+                    # Non-PIC: sequential positions
+                    pl = len(r.prefix_indices)
+                    miss_pos_list.extend(range(pl, r.fill_len))
+                    pic_a3_per_req_positions.append({"mode": "non_pic"})
+            return ids_list, miss_pos_list, pic_a3_per_req_positions
+
+        input_ids, _miss_positions_list, _pic_a3_per_req_info = (
+            _build_input_ids_and_miss_positions()
+        )
+        # Stash for later use (after pic_alloc runs) — see below
+        _any_pic_a3_new_path = any(
+            info.get("mode") == "pic_a3_new_path" for info in _pic_a3_per_req_info
+        )
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.fill_len for r in reqs]
         orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        # extend_lens: for PIC = miss_len per req; for non-PIC = extend_input_len
+        extend_lens = [len(ids) for ids in input_ids]
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -1929,9 +2124,214 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
+        # PIC: use segment-level allocation for GLM5.2 (completely replaces alloc_for_extend)
+        use_pic = (
+            hasattr(self.tree_cache, "dsa_state_pool")
+            and any(getattr(r, "pic_segments", None) for r in reqs)
         )
+        if use_pic:
+            from sglang.srt.pic.pic_alloc import pic_alloc_for_extend
+
+            dsa_state_pool = getattr(self.tree_cache, "dsa_state_pool", None)
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = pic_alloc_for_extend(
+                self, self.tree_cache,
+                self.token_to_kv_pool_allocator,
+                dsa_state_pool,
+            )
+            # Store actual miss token positions (for ForwardBatch positions override)
+            _dev = self.device
+            if _miss_positions_list:
+                self.pic_miss_positions = torch.tensor(
+                    _miss_positions_list, dtype=torch.int64
+                ).to(_dev, non_blocking=True)
+            else:
+                self.pic_miss_positions = None
+
+            # Build flat hit-slot tensors for _pic_prepopulate_hit_slots in model_runner.
+            # All hit segments across all requests concatenated into three parallel tensors:
+            #   pic_all_hit_pub_slots[i]: public KV slot index for hit token i
+            #   pic_all_hit_priv_slots[i]: private KV slot index for hit token i
+            #   pic_all_hit_delta_pos[i]:  delta position shift (new_start - old_start)
+            _pub_segs: List[torch.Tensor] = []
+            _priv_segs: List[torch.Tensor] = []
+            _dlt_segs: List[torch.Tensor] = []
+            for _req in reqs:
+                for (s, e), hit_info in _req.pic_rope_hit_private_slots.items():
+                    _priv_slots, _pub_kv, _old_start = hit_info
+                    seg_len = e - s
+                    _pub_segs.append(_pub_kv[:seg_len])
+                    _priv_segs.append(_priv_slots[:seg_len])
+                    _dlt_segs.append(torch.full((seg_len,), s - _old_start, dtype=torch.int64))
+            if _pub_segs:
+                self.pic_all_hit_pub_slots  = torch.cat(_pub_segs).to(_dev, non_blocking=True)
+                self.pic_all_hit_priv_slots = torch.cat(_priv_segs).to(_dev, non_blocking=True)
+                self.pic_all_hit_delta_pos  = torch.cat(_dlt_segs).to(_dev, non_blocking=True)
+            else:
+                self.pic_all_hit_pub_slots  = None
+                self.pic_all_hit_priv_slots = None
+                self.pic_all_hit_delta_pos  = None
+
+            # Also build per-forward-token hit metadata (used by the K-override
+            # branch in forward_mla.py:556). Length must equal the number of
+            # tokens actually in the forward batch (input_ids length).
+            #
+            # Legacy (pic mode + pic_a3/pic_cacheblend .pt path): only miss
+            #   tokens are in the forward, so all entries -1.
+            # pic_a3 new-path: full_len tokens in the forward; forward_mla
+            #   still short-circuits via _ln_skip_split (§3.5), so keep -1 here
+            #   too. The pic_a3-specific hit info lives in the new
+            #   pic_a3_is_hit_mask / pic_a3_hit_pub_slots tensors below.
+            _hit_pub_list: List[torch.Tensor] = []
+            _hit_delta_list: List[torch.Tensor] = []
+            for _req_i, _req in enumerate(reqs):
+                if not _req.pic_segments:
+                    # Non-PIC: sequential -1 for hit pub, 0 for delta
+                    _n = len(list(_req.get_fill_ids()[len(_req.prefix_indices):]))
+                    _hit_pub_list.append(torch.full((_n,), -1, dtype=torch.int64))
+                    _hit_delta_list.append(torch.zeros(_n, dtype=torch.int64))
+                    continue
+
+                if _pic_a3_per_req_info[_req_i].get("mode") == "pic_a3_new_path":
+                    # pic_a3 new-path: full_len tokens in forward. Keep -1
+                    # everywhere; forward_mla's _ln_skip_split ensures we
+                    # never load from public in layer 0-1 anyway.
+                    _n = _pic_a3_per_req_info[_req_i]["full_len"]
+                    _hit_pub_list.append(torch.full((_n,), -1, dtype=torch.int64))
+                    _hit_delta_list.append(torch.zeros(_n, dtype=torch.int64))
+                    continue
+
+                # Legacy PIC (miss-only in forward)
+                for (s, e) in _req.pic_segments:
+                    if (s, e) not in set(_req.pic_miss_segments):
+                        continue
+                    seg_len = e - s
+                    _hit_pub_list.append(torch.full((seg_len,), -1, dtype=torch.int64))
+                    _hit_delta_list.append(torch.zeros(seg_len, dtype=torch.int64))
+            if _hit_pub_list:
+                self.pic_hit_pub_kv_loc = torch.cat(_hit_pub_list).to(_dev, non_blocking=True)
+                self.pic_hit_delta_pos  = torch.cat(_hit_delta_list).to(_dev, non_blocking=True)
+            else:
+                self.pic_hit_pub_kv_loc = None
+                self.pic_hit_delta_pos  = None
+
+            # === pic_a3 new-path: build is_hit_mask / hit_pub_slots ===
+            # Consumed by forward_batch_info.py:_maybe_populate_reuse_fields
+            # (see :1639-1640) and downstream by reuse_utils / deepseek_v2 hook.
+            # Length = full_len per pic_a3-new-path req; other reqs contribute 0-len chunks.
+            if _any_pic_a3_new_path:
+                _a3_hit_mask_list: List[torch.Tensor] = []
+                _a3_hit_pub_list: List[torch.Tensor] = []
+                for _req_i, _req in enumerate(reqs):
+                    _info = _pic_a3_per_req_info[_req_i]
+                    if _info.get("mode") != "pic_a3_new_path":
+                        # Non-pic_a3-new-path reqs contribute zeros for
+                        # is_hit_mask (all False) and -1 for hit_pub_slots
+                        # over their input_ids-length chunk. Keeps the flat
+                        # tensor aligned with input_ids across mixed batches.
+                        _n_local = len(list(input_ids[_req_i]))
+                        _a3_hit_mask_list.append(torch.zeros(_n_local, dtype=torch.bool))
+                        _a3_hit_pub_list.append(torch.full((_n_local,), -1, dtype=torch.int64))
+                        continue
+                    # pic_a3 new-path: build per-position hit mask + pub_slot lookup
+                    _full_len = _info["full_len"]
+                    _mask = torch.zeros(_full_len, dtype=torch.bool)
+                    _pub = torch.full((_full_len,), -1, dtype=torch.int64)
+                    # Fill hit positions with their pub_slot index (from
+                    # pic_alloc's pic_rope_hit_private_slots; pub_kv_slots is
+                    # the 2nd tuple element)
+                    for (s, e), _hit_info in getattr(
+                        _req, "pic_rope_hit_private_slots", {}
+                    ).items():
+                        _, _pub_kv_slots, _ = _hit_info
+                        seg_len = e - s
+                        _mask[s:e] = True
+                        # _pub_kv_slots is a device tensor; move slice to cpu for mask
+                        _pub[s:e] = _pub_kv_slots[:seg_len].to(dtype=torch.int64, device="cpu")
+                    _a3_hit_mask_list.append(_mask)
+                    _a3_hit_pub_list.append(_pub)
+                self.pic_a3_is_hit_mask = torch.cat(_a3_hit_mask_list).to(
+                    _dev, non_blocking=True
+                )
+                self.pic_a3_hit_pub_slots = torch.cat(_a3_hit_pub_list).to(
+                    _dev, non_blocking=True
+                )
+                # pic_a3_l01_scratch_flat and pic_a3_l2plus_* are populated
+                # inside pic_alloc (see pic/pic_alloc.py); they're already on
+                # `self` at this point.
+            else:
+                self.pic_a3_is_hit_mask = None
+                self.pic_a3_hit_pub_slots = None
+
+            # === Segment-isolated k_start (all pic modes) ===
+            # For any pic-mode req (pic / pic_a3 / pic_cacheblend, hit or cold
+            # cache), enforce strict segment isolation: every non-last segment
+            # attends only within itself; the last segment (query region)
+            # attends to [0, p+1). Aligned with input_ids so dsa_backend can
+            # index it directly per Q token.
+            #
+            # pic_a3 new-path: input_ids covers full_len → per-position kstart.
+            # pic legacy: input_ids covers miss segments in position order →
+            #   per-miss-position kstart (each miss segment contributes its
+            #   own kstart value: 0 if last, seg_start otherwise).
+            _any_pic_req = any(
+                info.get("mode") in ("pic_a3_new_path", "pic_legacy")
+                for info in _pic_a3_per_req_info
+            )
+            if _any_pic_req:
+                _kstart_list: List[torch.Tensor] = []
+                for _req_i, _req in enumerate(reqs):
+                    _info = _pic_a3_per_req_info[_req_i]
+                    _mode = _info.get("mode")
+                    _segs = list(getattr(_req, "pic_segments", None) or [])
+                    _last_seg = _segs[-1] if _segs else None
+                    if _mode == "pic_a3_new_path":
+                        _full_len = _info["full_len"]
+                        _kstart = torch.zeros(_full_len, dtype=torch.int32)
+                        for (s, e) in _segs:
+                            if _last_seg is not None and (s, e) == _last_seg:
+                                continue  # query region: kstart=0 (sees all)
+                            _kstart[s:e] = int(s)
+                        _kstart_list.append(_kstart)
+                    elif _mode == "pic_legacy":
+                        # Miss-only input_ids: build kstart per miss segment
+                        # in the same order as _build_input_ids_and_miss_positions
+                        # emits them (iterate pic_segments, take miss ones).
+                        _miss_set = set(_req.pic_miss_segments)
+                        _pieces: List[torch.Tensor] = []
+                        for (s, e) in _segs:
+                            if (s, e) not in _miss_set:
+                                continue
+                            seg_len = e - s
+                            if _last_seg is not None and (s, e) == _last_seg:
+                                _pieces.append(
+                                    torch.zeros(seg_len, dtype=torch.int32)
+                                )  # query region
+                            else:
+                                _pieces.append(
+                                    torch.full(
+                                        (seg_len,), int(s), dtype=torch.int32
+                                    )
+                                )  # segment-isolated middle miss
+                        _kstart_list.append(
+                            torch.cat(_pieces)
+                            if _pieces
+                            else torch.zeros(0, dtype=torch.int32)
+                        )
+                    else:
+                        # non_pic req in a mixed batch: zeros over its chunk
+                        _n_local = len(list(input_ids[_req_i]))
+                        _kstart_list.append(
+                            torch.zeros(_n_local, dtype=torch.int32)
+                        )
+                self.pic_layer_kstart_flat = torch.cat(_kstart_list).to(
+                    _dev, non_blocking=True
+                )
+            else:
+                self.pic_layer_kstart_flat = None
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+                self
+            )
 
         # Set fields
         input_embeds = []
@@ -2500,6 +2900,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+
+        # PIC K-override tensors are prefill-only. In pic_a3 / pic_cacheblend
+        # mode prefill sets pic_hit_pub_kv_loc to real pub_slot indices with
+        # length = prompt_len; the K-override branch in forward_mla.py would
+        # then fire in decode with shape mismatch (k_nope.shape[0]==1 vs
+        # pic_hit_pub_kv_loc.shape[0]==prompt_len). In plain pic mode this
+        # was silently OK because pic_hit_pub_kv_loc was all -1, but the
+        # cleanup is correct regardless — decode should never do PIC K-override.
+        self.pic_hit_pub_kv_loc = None
+        self.pic_hit_delta_pos = None
+        self.pic_all_hit_pub_slots = None
+        self.pic_all_hit_priv_slots = None
+        self.pic_all_hit_delta_pos = None
+        self.pic_public_out_loc = None
+        self.pic_miss_positions = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:

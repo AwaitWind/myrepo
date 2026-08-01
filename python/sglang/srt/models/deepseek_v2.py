@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -2099,6 +2100,119 @@ class DeepseekV2DecoderLayer(nn.Module):
             getattr(self, "_gfx95_quant_format", ""),
         )
 
+        # ── K-dump 观测台: dump the QUERY segment's HIDDEN STATE (residual stream)
+        # per layer. After prepare_attn, `residual` is the MATERIALIZED residual
+        # stream entering this layer (input_layernorm returns (rmsnorm(h+r), h+r))
+        # — i.e. "layer L's hidden state", already all-reduced so no fusion caveat.
+        # Query rows are computed by every mode → comparable. Env-gated, rank0,
+        # measure-prefill, PIC-family. Overwrites per forward. try/except = safe.
+        try:
+            import os as _os_hd
+
+            _hd = _os_hd.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+            if (
+                _hd
+                and _os_hd.environ.get("SGLANG_PIC_KDUMP_ALL", "0") == "1"
+                and residual is not None
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.seq_lens is not None
+                and int(forward_batch.seq_lens[0].item()) >= 3000
+                and positions is not None
+            ):
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank as _tprk_h,
+                )
+
+                _reqs_h = getattr(forward_batch, "_reqs_ref", None)
+                _segs_h = (
+                    getattr(_reqs_h[0], "pic_segments", None) if _reqs_h else None
+                )
+                if _tprk_h() == 0 and _segs_h:
+                    _qs, _qe = _segs_h[-1]
+                    _qm = (positions >= int(_qs)) & (positions < int(_qe))
+                    if bool(_qm.any()):
+                        _lid = int(getattr(self.self_attn, "layer_id", -1))
+                        _os_hd.makedirs(_hd, exist_ok=True)
+                        _tag_h = _os_hd.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                        torch.save(
+                            residual[_qm].detach().float().cpu(),
+                            f"{_hd}/{_tag_h}_H_L{_lid}.pt",
+                        )
+        except Exception:
+            pass
+
+        # ── HALL: dump ALL forwarded rows' hidden (residual) + positions per layer.
+        # For clipped modes (pic_a3) the forwarded rows at deep layers ARE the
+        # RECOMPUTED tokens (imp ∪ miss) — lets us compare ONLY the recomputed
+        # tokens' hidden vs full_recompute. Gated by SGLANG_PIC_KDUMP_HALL=1. bf16.
+        try:
+            import os as _os_ha
+
+            if (
+                _os_ha.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+                and _os_ha.environ.get("SGLANG_PIC_KDUMP_HALL", "0") == "1"
+                and residual is not None
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.seq_lens is not None
+                and int(forward_batch.seq_lens[0].item()) >= 3000
+                and positions is not None
+            ):
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank as _tprk_ha,
+                )
+
+                if _tprk_ha() == 0:
+                    _lid_ha = int(getattr(self.self_attn, "layer_id", -1))
+                    _had = _os_ha.environ["SGLANG_PIC_KDUMP_DIR"]
+                    _os_ha.makedirs(_had, exist_ok=True)
+                    _tag_ha = _os_ha.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                    torch.save(
+                        {
+                            "h": residual.detach().to(torch.bfloat16).cpu(),
+                            "pos": positions.detach().long().cpu(),
+                        },
+                        f"{_had}/{_tag_ha}_HALL_L{_lid_ha}.pt",
+                    )
+        except Exception:
+            pass
+
+        # ── K-dump 观测台: dump the FULL-sequence residual stream at check layers
+        # {1,20,40,60}. For the full_recompute (FORCE_ALL_IMP) reference this is
+        # DENSE (all positions forwarded) → the true in-context hidden to compare
+        # oracle's reconstructed RSFULL against. Gated by SGLANG_PIC_KDUMP_RS=1.
+        try:
+            import os as _os_rd
+
+            if (
+                _os_rd.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+                and _os_rd.environ.get("SGLANG_PIC_KDUMP_RS", "0") == "1"
+                and residual is not None
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.seq_lens is not None
+                and int(forward_batch.seq_lens[0].item()) >= 3000
+                and positions is not None
+            ):
+                _lid2 = int(getattr(self.self_attn, "layer_id", -1))
+                _rs_all = _os_rd.environ.get("SGLANG_PIC_KDUMP_RS_ALL", "0") == "1"
+                if _rs_all or _lid2 in (1, 20, 40, 60):
+                    from sglang.srt.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank as _tprk_rd,
+                    )
+
+                    if _tprk_rd() == 0:
+                        _rdd = _os_rd.environ["SGLANG_PIC_KDUMP_DIR"]
+                        _os_rd.makedirs(_rdd, exist_ok=True)
+                        _tag_rd = _os_rd.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                        torch.save(
+                            {
+                                "h": residual.detach().to(torch.bfloat16).cpu(),
+                                "pos": positions.detach().long().cpu(),
+                            },
+                            f"{_rdd}/{_tag_rd}_RS_L{_lid2}.pt",
+                        )
+        except Exception:
+            pass
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2113,6 +2227,46 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
+
+        # ── K-dump 观测台: dump the QUERY segment's ATTENTION OUTPUT per layer ──
+        # (for the query-region attention-deviation plot). hidden_states here IS
+        # the self_attn output (pre-MLP). Query rows are computed by every mode
+        # (query is never clipped), so this is comparable across modes. Env-gated,
+        # rank0, measure-prefill, PIC-family (needs pic_segments). Overwrites per
+        # forward. Isolated + try/except → zero effect when the dump env is off.
+        try:
+            import os as _os_ad
+
+            _ad = _os_ad.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+            if (
+                _ad
+                and _os_ad.environ.get("SGLANG_PIC_KDUMP_ALL", "0") == "1"
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.seq_lens is not None
+                and int(forward_batch.seq_lens[0].item()) >= 3000
+                and positions is not None
+            ):
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank as _tprk_a,
+                )
+
+                _reqs_a = getattr(forward_batch, "_reqs_ref", None)
+                _segs_a = (
+                    getattr(_reqs_a[0], "pic_segments", None) if _reqs_a else None
+                )
+                if _tprk_a() == 0 and _segs_a:
+                    _qs, _qe = _segs_a[-1]
+                    _qm = (positions >= int(_qs)) & (positions < int(_qe))
+                    if bool(_qm.any()):
+                        _lid = int(getattr(self.self_attn, "layer_id", -1))
+                        _os_ad.makedirs(_ad, exist_ok=True)
+                        _tag_a = _os_ad.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                        torch.save(
+                            hidden_states[_qm].detach().float().cpu(),
+                            f"{_ad}/{_tag_a}_A_L{_lid}.pt",
+                        )
+        except Exception:
+            pass
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2407,6 +2561,13 @@ class DeepseekV2Model(nn.Module):
         if dsa_use_prefill_cp(
             forward_batch, self.dsa_enable_prefill_cp
         ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+            # A³ / CacheBlend baseline does not support prefill-CP: the
+            # per-layer imp_indices state and the CP scatter/rebuild both want
+            # to rewrite `positions` and can conflict.
+            assert getattr(forward_batch, "reuse_method", None) is None, (
+                "A³/CacheBlend does not support prefill CP; disable prefill CP "
+                "or drop the --enable-a3/--enable-cacheblend flag."
+            )
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2435,7 +2596,102 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         topk_indices = None
+
+        # ── PIC + A³/CacheBlend new-path hook (v1) ──────────────────────
+        # See scripts/pic_a3_full_recompute_plan.md §3.6.
+        # Layer 0-1: full-length forward writes to l01_scratch slots.
+        # Layer 1 boundary: pick imp, rewrite req_to_token_pool, rebuild
+        #   DSA metadata, free scratch, clip tensors.
+        # Layer 2+: (miss+imp)-only Q against full-len K pool via DSA native.
+        _pic_a3_active = getattr(forward_batch, "pic_a3_new_path", False)
+        _reuse_check_layer = 1  # aligned with reuse_utils.CHECK_LAYER
+
+        # A³ multi-layer research probe (server_args.a3_check_layers).
+        #   _pic_a3_multi: more than one check layer requested.
+        #   Phase B (keep-all-alive dynamic re-selection) is opt-in via env;
+        #   when off, multi-layer runs Phase A = production single-layer apply +
+        #   read-only probe logging at the extra check layers.
+        _pic_a3_multi = _pic_a3_active and getattr(
+            forward_batch, "pic_a3_multiselect", False
+        )
+        _pic_a3_keep_alive = _pic_a3_multi and (
+            os.environ.get("SGLANG_PIC_A3_KEEP_ALIVE", "0") == "1"
+        )
+        _pic_a3_probe = _pic_a3_multi and not _pic_a3_keep_alive
+        # Route-A clip (SGLANG_PIC_A3_CLIP_CAPTURE): per-check-layer clip to
+        # (miss∪imp') instead of full-length keepalive. Per-forward local flags.
+        # ONLY clip on a measure forward (every non-query segment is a hit); a
+        # warmup forward has document segments as MISS (being captured) and must
+        # run FULL-LENGTH so capture stores each segment's hidden at EVERY check
+        # layer — clipping during warmup would drop rows before layers 20/40/60
+        # capture them, leaving the store incomplete → measure reselect BAILs.
+        _pic_a3_clip_cap = _pic_a3_keep_alive and envs.SGLANG_PIC_A3_CLIP_CAPTURE.get()
+        if _pic_a3_clip_cap:
+            _reqs0 = getattr(forward_batch, "_reqs_ref", None)
+            _rq = _reqs0[0] if _reqs0 and len(_reqs0) == 1 else None
+            _nseg = len(getattr(_rq, "pic_segments", None) or []) if _rq else 0
+            _nhit = len(getattr(_rq, "pic_hit_segments", None) or []) if _rq else 0
+            # all non-query segments hit ⇔ measure forward
+            _pic_a3_clip_cap = _nseg >= 2 and _nhit == (_nseg - 1)
+        # PIC_A3_CLIP_REAL_L1 (default ON): make the clip/oracle path's FRONT
+        # (layer-1) boundary behave EXACTLY like single-layer pic_a3 — real
+        # in-context hidden (skip the isolated oracle inject at layer 1) AND real
+        # imp selection (_pic_a3_pick_imp from the live layer-1 stash, not the
+        # isolated-store reselect_full). Deep check layers (20/40/60) keep the
+        # isolated oracle path (深层重算 unchanged). =0 reverts to the fully-
+        # isolated layer 1. NOTE: flipping only the imp picker used to make "no
+        # difference" because the inject still fed pick_imp an isolated-derived
+        # stash — skipping the layer-1 inject is the necessary other half.
+        _pic_a3_l1_real = os.environ.get("PIC_A3_CLIP_REAL_L1", "1") == "1"
+        _pic_a3_clipped_once = False
+        _a3_check_set = set()
+        if _pic_a3_multi:
+            _a3_check_set = {
+                int(x)
+                for x in getattr(forward_batch, "a3_check_layers", (1,))
+                if 1 <= int(x) < normal_end_layer
+            }
+            _a3_check_set.add(_reuse_check_layer)
+
+        if _pic_a3_active:
+            assert not forward_batch.can_run_tbo, (
+                "pic_a3 new-path does not support TBO in v1; "
+                "disable --enable-tbo or don't use --enable-a3/--enable-cacheblend"
+            )
+            assert self.pp_group.world_size == 1, (
+                "pic_a3 new-path does not support PP-split in v1 "
+                "(hidden_states shape changes mid-forward would break PP proxy)"
+            )
+            # v1 disables aux hidden capture (layer 0-1 vs layer 2+ shapes differ)
+            _layers_to_capture_saved = self.layers_to_capture
+            self.layers_to_capture = []
+
         for i in range(normal_start_layer, normal_end_layer):
+            # pic_a3 state machine transition
+            if _pic_a3_active:
+                if _pic_a3_clip_cap:
+                    # Route-A: before the first clip, run full-length (checking on
+                    # check layers, None else). Once clipped, stay postchecking for
+                    # ALL subsequent layers (incl. check layers) so DSA uses the
+                    # clipped _is_pic_a3_l2plus branch with the current rowset.
+                    forward_batch.reuse_check_state = (
+                        "postchecking"
+                        if _pic_a3_clipped_once
+                        else ("checking" if i in _a3_check_set else None)
+                    )
+                elif _pic_a3_keep_alive:
+                    # Phase B: re-select at each check layer; NEVER postchecking
+                    # (keeps DSA in the full-length _is_pic_seg causal branch).
+                    forward_batch.reuse_check_state = (
+                        "checking" if i in _a3_check_set else None
+                    )
+                elif i == _reuse_check_layer:
+                    forward_batch.reuse_check_state = "checking"
+                elif i > _reuse_check_layer:
+                    forward_batch.reuse_check_state = "postchecking"
+                else:
+                    forward_batch.reuse_check_state = None
+
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
@@ -2451,6 +2707,30 @@ class DeepseekV2Model(nn.Module):
                         aux_hidden_states.append(aux_hidden_state)
                     else:
                         aux_hidden_states.append(hidden_states + residual)
+                # pic_a3_oracle: at each check layer, BEFORE the layer runs,
+                # capture the isolated-warmup segment hidden (first miss) and/or
+                # inject it for hit segments, so the layer re-picks imp and
+                # recomputes imp KV from accurate (undrifted) input (做法 1).
+                # No-op unless SGLANG_PIC_A3_ORACLE (checked inside the helper);
+                # gated here to skip the call on non-check layers.
+                # PIC_A3_CLIP_REAL_L1 (default ON): in the clip path, layer 1 must
+                # see the REAL in-context hidden (like pic_a3), so skip the isolated
+                # oracle inject/capture at layer 1. Deep check layers still inject.
+                _skip_oracle_l1 = (
+                    _pic_a3_clip_cap
+                    and _pic_a3_l1_real
+                    and i == _reuse_check_layer
+                )
+                if (
+                    _pic_a3_keep_alive
+                    and i in _a3_check_set
+                    and not _skip_oracle_l1
+                ):
+                    hidden_states, residual = (
+                        self._pic_a3_model_runner._pic_a3_oracle_capture_or_inject(
+                            forward_batch, i, hidden_states, residual, positions
+                        )
+                    )
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -2462,6 +2742,293 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
+
+            # KV-dump artifact fix: snapshot req_to_token BEFORE the check-layer
+            # branch rewrites it, so the K-dump below reads layer i's ACTUAL slot
+            # map (what this layer used) instead of the next window's — fixes the
+            # boundary-layer (1/20/40/60) read artifact where the probe otherwise
+            # read post-rewrite slots and showed a spurious spike.
+            _kd_reqtok_snap = None
+            _mr_snap = getattr(self, "_pic_a3_model_runner", None)
+            if (
+                os.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+                and _mr_snap is not None
+                and forward_batch.req_pool_indices is not None
+                and forward_batch.seq_lens is not None
+            ):
+                _rx = int(forward_batch.req_pool_indices[0].item())
+                _sl = int(forward_batch.seq_lens[0].item())
+                _kd_reqtok_snap = _mr_snap.req_to_token_pool.req_to_token[
+                    _rx, :_sl
+                ].clone()
+
+            # pic_a3 Phase B keep-alive: per-window re-selection boundary at
+            # EACH check layer (no clip; full-length Q preserved for all layers).
+            if _pic_a3_clip_cap and i in _a3_check_set:
+                _mr = self._pic_a3_model_runner
+                # PIC_A3_CLIP_REAL_L1 (default ON, resolved above): at the FIRST
+                # check layer (layer 1) the FULL in-context latent stash is
+                # available, so pick imp with pic_a3's real `_pic_a3_pick_imp` —
+                # NOT the isolated-store `reselect_full`. Combined with skipping the
+                # layer-1 oracle inject (_skip_oracle_l1 above), layer 1 now matches
+                # single-layer pic_a3: real in-context hidden → real Q·K stash →
+                # real imp. Deeper check layers have no full-len real stash (rows
+                # are clipped), so they keep the isolated reselect_full (深层重算
+                # unchanged). PIC_A3_CLIP_REAL_L1=0 reverts to the isolated L1.
+                if i == _reuse_check_layer and _pic_a3_l1_real:
+                    _imp_new = _mr._pic_a3_pick_imp(forward_batch)
+                    _ok = _imp_new is not None
+                else:
+                    _imp_new, _ok = _mr._pic_a3_oracle_reselect_full(
+                        forward_batch, i, self.layers[i]
+                    )
+                if os.environ.get("SGLANG_PIC_KDUMP_SKIP_REBUILD", "0") == "1":
+                    # RSFULL-dump-only mode: _pic_a3_oracle_reselect_full above
+                    # already dumped the reconstructed rs_full for this layer. Skip
+                    # the heavy/boundary-risky rebuild AND the fallback so
+                    # --oracle-layers can span ALL 78 layers safely (isolated hidden
+                    # at every layer). Forward stays unclipped (output is garbage,
+                    # but we only want the RSFULL dumps).
+                    pass
+                elif _ok and _imp_new is not None:
+                    hidden_states, residual, positions, topk_indices = (
+                        _mr._pic_a3_rebuild_rowset_for_window(
+                            forward_batch, i, _imp_new,
+                            hidden_states, residual, positions,
+                            sorted(_a3_check_set), normal_end_layer,
+                            topk=topk_indices,
+                        )
+                    )
+                    _pic_a3_clipped_once = True
+                else:
+                    # capture incomplete → fall back to full-length keepalive.
+                    _mr._pic_a3_keepalive_window(
+                        forward_batch, layer_id=i,
+                        check_layers=sorted(_a3_check_set),
+                        num_layers=normal_end_layer, layer=self.layers[i],
+                    )
+            elif _pic_a3_keep_alive and i in _a3_check_set:
+                self._pic_a3_model_runner._pic_a3_keepalive_window(
+                    forward_batch,
+                    layer_id=i,
+                    check_layers=sorted(_a3_check_set),
+                    num_layers=normal_end_layer,
+                    layer=self.layers[i],
+                )
+            # pic_a3: layer 1 boundary — production single-layer path
+            elif _pic_a3_active and i == _reuse_check_layer:
+                full_len = int(forward_batch.extend_num_tokens)
+
+                # topk_indices semantics (forward_mla.py:902-909):
+                #   • Non-None → layer 2 will skip_topk and consume it as
+                #     prev_topk_indices; must be clipped to (miss+imp) rows.
+                #   • None → layer 2 will run its own indexer on the new q_len;
+                #     nothing to clip. This is normal for GLM-5.2 typical
+                #     index_topk_pattern where layer 1 is skip and layer 2
+                #     produces fresh.
+                # Only assert shape when we actually have a tensor.
+                if topk_indices is not None:
+                    assert topk_indices.shape[0] == full_len, (
+                        f"pic_a3: expected topk_indices rows == full_len="
+                        f"{full_len}, got {topk_indices.shape[0]}"
+                    )
+
+                # 1. Pick imp indices from layer-1 stash
+                _model_runner = self._pic_a3_model_runner
+                import time as _pt_bnd
+
+                torch.cuda.synchronize()
+                _ts0 = _pt_bnd.perf_counter()
+                _imp = _model_runner._pic_a3_pick_imp(forward_batch)
+                torch.cuda.synchronize()
+                _ts1 = _pt_bnd.perf_counter()
+
+                # 2. Rewrite req_to_token_pool for layer 2+ layout
+                _model_runner._pic_a3_rewrite_req_to_token_pool_for_l2plus(
+                    forward_batch
+                )
+                torch.cuda.synchronize()
+                _ts2 = _pt_bnd.perf_counter()
+
+                # 3. Prepop layer 2..N-1 KV buffers at hit-position l01_scratch
+                # slots with delta-RoPE-corrected public cache values. Hit-non-imp
+                # positions in req_to_token_pool still point at l01_scratch slots
+                # (unchanged by rewrite), so layer 2+ attention reads correct KV.
+                _model_runner._pic_a3_prepop_hit_slots_for_l2plus(forward_batch)
+                torch.cuda.synchronize()
+                _ts3 = _pt_bnd.perf_counter()
+                import logging as _plg_bnd
+
+                _plg_bnd.getLogger(__name__).warning(
+                    f"[PIC-BND-TIMING] full_len={full_len} "
+                    f"pick_imp={(_ts1 - _ts0) * 1000:.1f}ms "
+                    f"rewrite={(_ts2 - _ts1) * 1000:.1f}ms "
+                    f"prepop={(_ts3 - _ts2) * 1000:.1f}ms"
+                )
+
+                # NOTE: l01_scratch NOT freed here (v1 correctness first).
+                # v3 optimization: free only the miss/imp slice of l01_scratch
+                # (hit slice stays alive for layer 2..N-1's reads).
+
+                # 4. Update shape-derived fields (§3.6 必改点 1)
+                _new_qlen = int(
+                    forward_batch.pic_a3_l2plus_row_indices.numel()
+                )
+                forward_batch.extend_num_tokens = _new_qlen
+                forward_batch.extend_seq_lens = torch.tensor(
+                    [_new_qlen],
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
+                # extend_seq_lens_cpu is used as a Python list in many places
+                # (list-comp, max(), zip iteration in dsa_backend, etc.), so
+                # keep it a Python list even after mid-forward update.
+                forward_batch.extend_seq_lens_cpu = [_new_qlen]
+                # seq_lens / seq_lens_cpu UNCHANGED (K pool full-len — invariant C)
+
+                # 5. Rebuild DSA metadata for layer 2+ (§3.7.5)
+                forward_batch.out_cache_loc = (
+                    forward_batch.pic_a3_l2plus_out_cache_loc
+                )
+                forward_batch.pic_public_out_loc = (
+                    forward_batch.pic_a3_l2plus_pub_out_loc
+                )
+                _attn_backend = _model_runner.attn_backend
+                if hasattr(_attn_backend, "reset_and_init_forward_metadata"):
+                    _attn_backend.reset_and_init_forward_metadata(forward_batch)
+
+                # 6. Clip tensors (Q shrinks to miss+imp)
+                _clip = forward_batch.pic_a3_l2plus_row_indices
+                hidden_states = hidden_states[_clip]
+                if residual is not None:
+                    residual = residual[_clip]
+                positions = positions[_clip]
+
+                # 7. Clip topk_indices rows (if any); values still index full-K space
+                if topk_indices is not None:
+                    topk_indices = topk_indices[_clip]
+                    if topk_indices.numel() > 0:
+                        _max_idx = int(topk_indices.max().item())
+                        assert _max_idx < full_len, (
+                            f"pic_a3: topk_indices value {_max_idx} exceeds "
+                            f"full_len={full_len} — violates invariant C"
+                        )
+
+            # pic_a3 Phase A probe: at check layers > 1, log what a re-selection
+            # WOULD pick from that layer's stash (read-only — does NOT change the
+            # applied layer-1 selection). Validates the multi-layer plumbing.
+            if _pic_a3_probe and i in _a3_check_set and i != _reuse_check_layer:
+                self._pic_a3_model_runner._pic_a3_pick_imp_probe(forward_batch, i)
+
+            # imp-selection dump: WHICH token positions each mode picked as imp
+            # (recomputed fresh) at each check layer. pic_a3/cacheblend set it once
+            # at layer 1; oracle re-selects at every check layer. Absolute positions.
+            # Gated by SGLANG_PIC_KDUMP_IMP=1. Tiny (index list). pic-baseline has
+            # no pic_a3_imp_indices → auto-skipped.
+            try:
+                import os as _os_im
+
+                if (
+                    _os_im.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+                    and _os_im.environ.get("SGLANG_PIC_KDUMP_IMP", "0") == "1"
+                    and getattr(forward_batch, "pic_a3_imp_indices", None) is not None
+                    and forward_batch.forward_mode.is_extend()
+                    and forward_batch.seq_lens is not None
+                    and int(forward_batch.seq_lens[0].item()) >= 3000
+                    and i in (1, 20, 40, 60)
+                ):
+                    from sglang.srt.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank as _tprk_im,
+                    )
+
+                    if _tprk_im() == 0:
+                        _imd = _os_im.environ["SGLANG_PIC_KDUMP_DIR"]
+                        _os_im.makedirs(_imd, exist_ok=True)
+                        _tag_im = _os_im.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                        torch.save(
+                            forward_batch.pic_a3_imp_indices.detach().long().cpu(),
+                            f"{_imd}/{_tag_im}_IMP_L{int(i)}.pt",
+                        )
+            except Exception:
+                pass
+
+            # K-dump (debug): dump the K attention reads at deep layers for the
+            # single MEASURE prefill req, to compare per-segment K across modes
+            # (pic_a3_oracle clip vs full_recompute). Env-gated; default off.
+            _kd = os.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+            _mr_kd = getattr(self, "_pic_a3_model_runner", None)
+            # SGLANG_PIC_KDUMP_ALL=1 → dump EVERY layer (for the per-layer error
+            # 观测台 heatmap); default keeps the sparse {2,20,40,60,77} probe set.
+            _kd_all = os.environ.get("SGLANG_PIC_KDUMP_ALL", "0") == "1"
+            _kd_layer_ok = True if _kd_all else (i in (2, 20, 40, 60, 77))
+            if (
+                _kd
+                and _mr_kd is not None
+                and forward_batch.forward_mode.is_extend()
+                and _kd_layer_ok
+                and forward_batch.req_pool_indices is not None
+                and int(forward_batch.seq_lens[0].item()) >= 3000
+            ):
+                try:
+                    from sglang.srt.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank as _tprk,
+                    )
+
+                    if _tprk() == 0:
+                        os.makedirs(_kd, exist_ok=True)
+                        _ridx = int(forward_batch.req_pool_indices[0].item())
+                        _slen = int(forward_batch.seq_lens[0].item())
+                        _slots = (
+                            _kd_reqtok_snap
+                            if _kd_reqtok_snap is not None
+                            else _mr_kd.req_to_token_pool.req_to_token[_ridx, :_slen]
+                        )
+                        _kbuf = (
+                            _mr_kd.token_to_kv_pool.get_key_buffer(i)[_slots]
+                            .detach().float().cpu()
+                        )
+                        # 3-way tag so full_recompute / pic_a3 / keepalive-oracle
+                        # can be K-dumped in ONE invocation without colliding
+                        # (pic_a3 and oracle are both _pic_a3_active). keepalive is
+                        # distinguished by the SGLANG_PIC_A3_KEEP_ALIVE env.
+                        # Tag priority: explicit SGLANG_PIC_KDUMP_TAG (set per
+                        # mode by quick_test_online.py so full_recompute / pic /
+                        # pic_cacheblend don't all collide on the auto-tag "ref").
+                        # Fallback = the 3-way auto-tag (ref / clip / keepalive).
+                        _tag_env = os.environ.get("SGLANG_PIC_KDUMP_TAG", "")
+                        if _tag_env:
+                            _tag = _tag_env
+                        elif not _pic_a3_active:
+                            _tag = "ref"
+                        elif os.environ.get("SGLANG_PIC_A3_KEEP_ALIVE") == "1":
+                            _tag = "keepalive"
+                        else:
+                            _tag = "clip"
+                        # Per-forward counter (incremented at the first dumped
+                        # layer i==2) so multi-sample dataset runs dump each
+                        # measure forward under a distinct c{n} suffix — lets us
+                        # pick a COLLAPSING sample (the last-sample overwrite would
+                        # otherwise capture whichever sample ran last). Counter is
+                        # per-server (resets each mode) so c{n} is the same sample
+                        # index across ref/clip/keepalive at fixed N+seed.
+                        # Per-forward counter: increment at the FIRST dumped
+                        # layer of each qualifying forward (0 when dumping all
+                        # layers, else 2) so multi-forward runs get distinct c{n}.
+                        _kd_min = 0 if _kd_all else 2
+                        if i == _kd_min:
+                            self._pic_kd_fwd = int(getattr(self, "_pic_kd_fwd", 0)) + 1
+                        _c = int(getattr(self, "_pic_kd_fwd", 0))
+                        torch.save(_kbuf, f"{_kd}/{_tag}_L{i}_c{_c}.pt")
+                except Exception as _e_kd:
+                    import logging as _lg_kd
+
+                    _lg_kd.getLogger(__name__).warning(
+                        f"[PIC-KDUMP] L{i} failed: {_e_kd}"
+                    )
+
+        # Restore layers_to_capture (in case forward is called again)
+        if _pic_a3_active:
+            self.layers_to_capture = _layers_to_capture_saved
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

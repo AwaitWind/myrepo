@@ -86,6 +86,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    dsa_num: int = 0          # GLM5.2: DSA slot 需求数
 
 
 @dataclasses.dataclass
@@ -95,6 +96,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    dsa_num_evicted: int = 0   # GLM5.2: 已淘汰的 DSA slot 数
 
 
 @dataclasses.dataclass
@@ -176,6 +178,9 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        pic_segment_entries: PIC 缓存命中结果，列表长度等于 len(req.pic_segments)，
+                             每个元素为 Optional[SegmentEntry] 或 None。
+                             最后一项（最后段）必为 None（永不缓存）。
     """
 
     device_indices: torch.Tensor
@@ -187,6 +192,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    pic_segment_entries: Optional[list] = None  # PIC: List[Optional[SegmentEntry]]
 
 
 def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -227,7 +228,41 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                        # PIC split: kv_a_layernorm only for miss segments.
+                        # Defensive shape check: pic_hit_pub_kv_loc must have
+                        # the same length as the current forward's k_nope.
+                        # In decode this tensor should be None (cleared by
+                        # prepare_for_decode); the shape guard is belt-and-
+                        # suspenders in case it leaks from continuous batching.
+                        _pic_pub = getattr(forward_batch, "pic_hit_pub_kv_loc", None)
+                        # pic_a3 / pic_cacheblend: skip the split-layernorm
+                        # K-override branch. Under IMP_ONLY these two modes
+                        # only put miss+imp positions into input_ids; hit
+                        # positions never enter the forward, so there's no
+                        # k_nope to override here.
+                        _ln_pic_mode = getattr(forward_batch, "pic_mode", None)
+                        _ln_skip_split = _ln_pic_mode in ("pic_a3", "pic_cacheblend")
+                        if (
+                            not _ln_skip_split
+                            and _pic_pub is not None
+                            and _pic_pub.shape[0] == k_nope.shape[0]
+                            and (_pic_pub >= 0).any()
+                        ):
+                            _hit = _pic_pub >= 0
+                            _miss = ~_hit
+                            _buf = get_token_to_kv_pool().get_key_buffer(self.layer_id)
+                            k_nope = k_nope.clone()
+                            if _miss.any():
+                                k_nope[_miss] = self.kv_a_layernorm(k_nope[_miss])
+                            if _hit.any():
+                                # Load post-layernorm k_nope from public slot.
+                                # MLA KV buffer shape is (num_slots, 1, kv_cache_dim)
+                                # (single KV head — MQA). Index dim=1 with 0 to
+                                # collapse the KV-head dim, THEN slice the last
+                                # dim to grab k_nope.
+                                k_nope[_hit] = _buf[_pic_pub[_hit], 0, : self.kv_lora_rank].to(k_nope.dtype)
+                        else:
+                            k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -296,9 +331,46 @@ class DeepseekMLAForwardMixin:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            # PIC split: kv_a_proj_with_mqa only for miss segments.
+            # Hit segments load k_nope (post-layernorm) directly from the public KV slot,
+            # avoiding the projection and layernorm for those token positions.
+            _pic_pub = getattr(forward_batch, "pic_hit_pub_kv_loc", None)
+            # pic_a3 / pic_cacheblend new-path: skip the hit K load — layer 0-1
+            # is fresh-recompute-full-length (see plan §3.5); layer 2+ hit KV
+            # comes from PICache-populated public slots via req_to_token_pool.
+            # Mirror of the gate at :244 on the fused branch (previously missing
+            # here — see plan §1.4 / §3.5 Branch A').
+            _pic_mode_nonfused = getattr(forward_batch, "pic_mode", None)
+            _ln_skip_split_nonfused = _pic_mode_nonfused in ("pic_a3", "pic_cacheblend")
+            if (
+                not _ln_skip_split_nonfused
+                and _pic_pub is not None
+                and _pic_pub.shape[0] == hidden_states.shape[0]
+                and (_pic_pub >= 0).any()
+            ):
+                _hit = _pic_pub >= 0
+                _miss = ~_hit
+                _buf = get_token_to_kv_pool().get_key_buffer(self.layer_id)
+                kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
+                latent_cache = hidden_states.new_empty(hidden_states.shape[0], kv_dim)
+                # KV projection only for miss positions (real compute saving!)
+                if _miss.any():
+                    latent_cache[_miss] = self.kv_a_proj_with_mqa(hidden_states[_miss])[0]
+                # Hit positions: load from public slot
+                # k_nope part is post-layernorm; k_pe part is post-RoPE at old positions
+                # (the delta-RoPE block below will correct k_pe to current positions)
+                if _hit.any():
+                    # MLA buffer is (num_slots, 1, kv_cache_dim) — collapse dim 1.
+                    latent_cache[_hit] = _buf[_pic_pub[_hit], 0].to(latent_cache.dtype)
+                # Layernorm: only for miss positions (hit already post-layernorm)
+                k_nope = latent_cache[..., : self.kv_lora_rank].clone()
+                if _miss.any():
+                    k_nope[_miss] = self.kv_a_layernorm(k_nope[_miss])
+                # k_nope[hit] stays as the cached post-layernorm value
+            else:
+                latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+                k_nope = self.kv_a_layernorm(latent_cache[..., : self.kv_lora_rank])
+            k_nope = k_nope.unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
@@ -395,6 +467,33 @@ class DeepseekMLAForwardMixin:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+
+        # head-level KV probe: dump w_kc (per-head K up-proj) so per-head K can be
+        # decompressed offline from the shared MLA latent. Dumped on ALL TP ranks
+        # (rank-tagged) → all heads reconstructable. Constant weight → written once
+        # per (layer, rank). Gated by SGLANG_PIC_KDUMP_WKC=<dir>.
+        try:
+            import os as _os_wc
+
+            _wcd = _os_wc.environ.get("SGLANG_PIC_KDUMP_WKC", "")
+            if _wcd and hasattr(self, "w_kc") and torch.is_tensor(self.w_kc):
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank as _tprk_wc,
+                )
+
+                _rk = int(_tprk_wc())
+                _wf = f"{_wcd}/wkc_L{int(self.layer_id)}_r{_rk}.pt"
+                if not _os_wc.path.exists(_wf):
+                    _os_wc.makedirs(_wcd, exist_ok=True)
+                    _save = {"w_kc": self.w_kc.detach().float().cpu(),
+                             "dtype": str(self.w_kc.dtype)}
+                    for _a in ("w_scale", "w_scale_k"):
+                        _v = getattr(self, _a, None)
+                        if torch.is_tensor(_v):
+                            _save[_a] = _v.detach().float().cpu()
+                    torch.save(_save, _wf)
+        except Exception:
+            pass
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_q_apply,
@@ -415,11 +514,149 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        # PIC transition_rope: for hit segments, correct k_nope and k_pe using
+        # cached public KV + delta-RoPE so the attention sees K at the current
+        # positions without re-running the fused projection for those tokens.
+        #
+        # delta-RoPE correctness:
+        #   k_pe_old[i] = W_pe*x[i] * RoPE(old_start + i)   (stored in public slot)
+        #   k_pe_new[i] = W_pe*x[i] * RoPE(new_start + i)
+        #              = apply_rope(k_pe_old[i], delta)        delta = new_start - old_start
+        # The delta is constant for every token within one segment, so calling
+        # self.rotary_emb with a constant position tensor applies the correct shift.
+        #
+        # k_nope is position-free (W_kv*x after layernorm), so we directly load
+        # the cached value — identical to freshly computing it for the same tokens.
+        _pub_kv_loc = getattr(forward_batch, "pic_hit_pub_kv_loc", None)
+        # Defensive shape check: PIC K-override only makes sense when the
+        # tensor length matches the current batch length. In decode the tensor
+        # should be None (cleared by prepare_for_decode); the shape guard
+        # protects against leaked prefill tensors under continuous batching.
+        if _pub_kv_loc is not None and _pub_kv_loc.shape[0] != k_nope.shape[0]:
+            _pub_kv_loc = None
+        # pic_a3 / pic_cacheblend: skip the K-override — hit positions never
+        # enter the forward under IMP_ONLY. They were pre-populated into the
+        # KV pool by _pic_prepopulate_hit_slots before this call.
+        _pic_mode = getattr(forward_batch, "pic_mode", None)
+        _skip_k_override = _pic_mode in ("pic_a3", "pic_cacheblend")
+
+        if _pub_kv_loc is not None and not _skip_k_override:
+            _hit = _pub_kv_loc >= 0
+            if _hit.any():
+                _pub_slots = _pub_kv_loc[_hit]
+                _delta = forward_batch.pic_hit_delta_pos[_hit]
+
+                # Load cached k_nope and k_pe from the public KV pool.
+                # MLA buffer is (num_slots, 1, kv_cache_dim) — collapse dim 1
+                # via [_, 0, _] indexing to get a 2D view.
+                _kv_buf = get_token_to_kv_pool().get_key_buffer(self.layer_id)
+                # Shape: (n_hit, kv_lora_rank + qk_rope_head_dim)
+                _cached = _kv_buf[_pub_slots, 0].to(k_nope.dtype)
+
+                # k_nope: position-free, copy directly  (n_hit, 1, kv_lora_rank)
+                _k_nope_hit = _cached[:, : self.kv_lora_rank].unsqueeze(1)
+
+                # k_pe: apply delta-RoPE to shift from old position to new position
+                # (n_hit, 1, qk_rope_head_dim)
+                _k_pe_old = _cached[:, self.kv_lora_rank :].unsqueeze(1)
+                if self.rotary_emb is not None and _delta.any():
+                    _dummy = torch.zeros_like(_k_pe_old)
+                    _, _k_pe_hit = self.rotary_emb(_delta, _dummy, _k_pe_old)
+                else:
+                    _k_pe_hit = _k_pe_old
+
+                k_nope = k_nope.clone()
+                k_pe = k_pe.clone()
+                k_nope[_hit] = _k_nope_hit
+                k_pe[_hit] = _k_pe_hit
+
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )
+
+        # ── pic_a3 new-path: stash latent Q/K for imp selection ──
+        # Fires at every A³ check layer (forward_batch.a3_check_layers; default
+        # (1,) == the single-layer pic_a3). Keyed per-layer in
+        # pic_a3_stash_by_layer; pic_a3_layer1_stash kept as an alias so the
+        # single-layer boundary in deepseek_v2 keeps working unchanged.
+        #   q_nope_out: (N, H, kv_lora_rank)  — absorbed Q (= q_nope · w_kc)
+        #   k_nope:     (N, 1, kv_lora_rank)  — post-layernorm K latent
+        #   k_pe:       (N, 1, qk_rope_head_dim)  — post-RoPE at fresh positions
+        #   q_pe:       (N, H, qk_rope_head_dim)  — post-RoPE
+        # Clone to detach from the graph so the layer's attention still runs
+        # freely; imp selection consumes the stash after the layer returns.
+        _a3_check_layers = getattr(forward_batch, "a3_check_layers", (1,))
+        if (
+            getattr(forward_batch, "pic_a3_new_path", False)
+            and int(self.layer_id) in _a3_check_layers
+        ):
+            _stash = {
+                "q_absorbed": q_nope_out.detach().clone(),
+                "k_latent": k_nope.detach().clone(),
+                "q_pe": q_pe.detach().clone(),
+                "k_pe": k_pe.detach().clone(),
+                "softmax_scale": float(self.scaling),
+                "kv_lora_rank": int(self.kv_lora_rank),
+                "layer_id": int(self.layer_id),
+            }
+            if getattr(forward_batch, "pic_a3_stash_by_layer", None) is None:
+                forward_batch.pic_a3_stash_by_layer = {}
+            forward_batch.pic_a3_stash_by_layer[int(self.layer_id)] = _stash
+            if int(self.layer_id) == 1:
+                forward_batch.pic_a3_layer1_stash = _stash
+
+        # ── K-dump 观测台: dump the QUERY segment's summed-Q per layer ──
+        # For the offline attention-weighted-KV-deviation plot. MLA's K is
+        # MQA-shared, so the A3 merged-head score factorizes:
+        #   score[q,k] = (Σ_heads [q_absorbed, q_pe][q,h]) · K576[k] * merged_scale
+        # → we only need Σ_heads of the query rows' [q_absorbed,q_pe] (576-dim,
+        # tiny). Env-gated (SGLANG_PIC_KDUMP_DIR + _ALL), rank0, measure-prefill,
+        # PIC-family only (needs pic_segments for the query seg). Overwrites per
+        # forward (last=correctness sample). Isolated + try/except → zero risk off.
+        try:
+            import os as _os_qd
+
+            _qd = _os_qd.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+            if (
+                _qd
+                and _os_qd.environ.get("SGLANG_PIC_KDUMP_ALL", "0") == "1"
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.seq_lens is not None
+                and int(forward_batch.seq_lens[0].item()) >= 3000
+            ):
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank as _tprk_q,
+                )
+
+                _reqs_q = getattr(forward_batch, "_reqs_ref", None)
+                _segs_q = (
+                    getattr(_reqs_q[0], "pic_segments", None) if _reqs_q else None
+                )
+                if _tprk_q() == 0 and _segs_q and positions is not None:
+                    _qs, _qe = _segs_q[-1]
+                    _qmask = (positions >= int(_qs)) & (positions < int(_qe))
+                    if bool(_qmask.any()):
+                        _H = int(q_nope_out.shape[1])
+                        _qsum = (
+                            torch.cat([q_nope_out, q_pe], dim=-1)[_qmask]
+                            .sum(dim=1)
+                        )
+                        _dpe = int(q_pe.shape[-1])
+                        _scale = 1.0 / ((_H * (int(self.kv_lora_rank) + _dpe)) ** 0.5)
+                        _os_qd.makedirs(_qd, exist_ok=True)
+                        _tag_q = _os_qd.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                        torch.save(
+                            {
+                                "q": _qsum.detach().float().cpu(),
+                                "scale": float(_scale),
+                                "qpos": positions[_qmask].detach().long().cpu(),
+                            },
+                            f"{_qd}/{_tag_q}_Q_L{int(self.layer_id)}.pt",
+                        )
+        except Exception:
+            pass
 
         return (
             q_pe,
@@ -432,6 +669,55 @@ class DeepseekMLAForwardMixin:
             topk_indices,
             llama_4_scaling,
         )
+
+    def project_latent_qk_from_normed(
+        self: DeepseekV2AttentionMLA,
+        normed_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> dict:
+        """pic_a3_oracle Route-A: recompute latent Q/K from a normalized hidden
+        state, for imp re-selection scoring ONLY. Returns the same dict shape as
+        the forward_absorb_prepare stash (q_absorbed/k_latent/q_pe/k_pe/...).
+        Forces bf16 for the w_kc absorption bmm (scoring is a topk, insensitive
+        to quant error). No side effects: no KV write, no stash, no forward_batch
+        mutation. Assumes the fused q_lora path (DeepSeek-V3 / GLM default).
+        """
+        assert (
+            self.q_lora_rank is not None
+        ), "Route-A projection assumes the fused q_lora path"
+        latent = self.prepare_qkv_latent(normed_hidden, forward_batch)
+        q, latent_cache = latent.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+        )
+        # Full layernorm (no PIC split — Route-A always recomputes all rows).
+        q = self.q_a_layernorm(q)
+        k_nope = self.kv_a_layernorm(latent_cache[..., : self.kv_lora_rank]).unsqueeze(
+            1
+        )
+        q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        # w_kc absorption forced bf16 (mirror the bf16 bmm branch at :442-467).
+        if self.w_kc.dtype == torch.float8_e4m3fn:
+            q_nope_out = torch.bmm(
+                q_nope.to(torch.bfloat16).transpose(0, 1),
+                self.w_kc.to(torch.bfloat16) * self.w_scale,
+            )
+        else:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+        q_nope_out = q_nope_out.transpose(0, 1)
+        if self.rotary_emb is not None:
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        return {
+            "q_absorbed": q_nope_out,
+            "k_latent": k_nope,
+            "q_pe": q_pe,
+            "k_pe": k_pe,
+            "softmax_scale": float(self.scaling),
+            "kv_lora_rank": int(self.kv_lora_rank),
+            "layer_id": int(self.layer_id),
+        }
 
     def forward_absorb_core(
         self: DeepseekV2AttentionMLA,
@@ -448,7 +734,10 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused()
+                and self.rotary_emb is not None
+            ):
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (

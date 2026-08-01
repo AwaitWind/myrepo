@@ -3344,6 +3344,1479 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         return (ret, can_run_graph)
 
+    def _pic_prepopulate_hit_slots(self, forward_batch: "ForwardBatch") -> None:
+        """Pre-populate hit segment private KV slots BEFORE the model forward.
+
+        For each PIC cache-hit segment, copies the public (cached) KV to the
+        newly-allocated private slot, applying delta-RoPE to the k_pe part so
+        it reflects the segment's current sequence position rather than the
+        position at which it was originally cached.
+
+        This lets the model forward skip those tokens entirely (only miss segment
+        tokens are passed as input), while the attention still sees correct K/V
+        for all sequence positions via req_to_token_pool.
+
+        Perf: stays in bf16 throughout (no fp32 round-trip), reuses a single
+        dummy tensor across layers, and splits hit tokens into a delta=0 fast
+        path (pure scatter-gather, no RoPE) vs a delta≠0 slow path. In the
+        common quick_test_online.py setup, ~2/3 of hit tokens (SYS + C1) have
+        delta=0 and take the fast path.
+        """
+        # pic_a3 new-path (§3.5, §3.9): layer 0-1 does FRESH full-length
+        # forward with all tokens in input_ids; the private slots at hit
+        # positions are l01_scratch that will be freed at the layer-2 boundary
+        # (see _pic_a3_rewrite_req_to_token_pool_for_l2plus below). We do NOT
+        # want to prepop stale public KV into l01_scratch — those slots must
+        # be filled by the fresh layer 0-1 attention kernel writes. Short-
+        # circuit here.
+        if getattr(forward_batch, "pic_a3_new_path", False):
+            return
+
+        # For legacy pic mode (and pic_a3/pic_cacheblend .pt path) the pre-
+        # population is LOAD-BEARING: hit tokens never enter the forward, so
+        # every non-imp position at every layer must be filled here (attn_mqa
+        # never writes them). Same story for plain `pic` mode.
+        pub_slots  = getattr(forward_batch, "pic_all_hit_pub_slots",  None)
+        priv_slots = getattr(forward_batch, "pic_all_hit_priv_slots", None)
+        delta_pos  = getattr(forward_batch, "pic_all_hit_delta_pos",  None)
+
+        if pub_slots is None or priv_slots is None or pub_slots.numel() == 0:
+            return
+
+        # Find rotary_emb from the model's first MLA attention layer.
+        rotary_emb = None
+        for module in self.model.modules():
+            if hasattr(module, "rotary_emb") and module.rotary_emb is not None:
+                rotary_emb = module.rotary_emb
+                break
+
+        # kv_lora_rank separates k_nope (position-free) from k_pe (position-encoded)
+        kv_lora_rank = getattr(self.model_config, "kv_lora_rank", None)
+
+        # Split hit tokens by whether they need delta-RoPE. Tokens with
+        # delta_pos == 0 are at the same position as when cached → their k_pe
+        # is already correct → pure gather-scatter, no RoPE compute.
+        need_rope = (
+            rotary_emb is not None
+            and delta_pos is not None
+            and kv_lora_rank is not None
+        )
+        if need_rope:
+            rope_mask = delta_pos != 0
+            has_any_rope = bool(rope_mask.any())
+            has_any_direct = bool((~rope_mask).any())
+            if has_any_rope:
+                rope_pub  = pub_slots[rope_mask]
+                rope_priv = priv_slots[rope_mask]
+                rope_delta = delta_pos[rope_mask]
+            if has_any_direct:
+                direct_pub  = pub_slots[~rope_mask]
+                direct_priv = priv_slots[~rope_mask]
+            # Preallocate dummy zeros for rotary_emb once, reused across layers.
+            # Shape is inferred from first-layer k_pe_old below.
+            _dummy_rope: Optional[torch.Tensor] = None
+        else:
+            has_any_rope = False
+            has_any_direct = True
+            direct_pub, direct_priv = pub_slots, priv_slots
+
+        for layer_id in range(self.start_layer, self.end_layer):
+            buf = self.token_to_kv_pool.get_key_buffer(layer_id)
+
+            # ── Fast path: direct scatter-gather for tokens with delta=0 ──
+            # Single kernel call, no float promotion, no temporary allocation.
+            if has_any_direct:
+                buf[direct_priv] = buf[direct_pub]
+
+            # ── Slow path: apply delta-RoPE to k_pe for shifted segments ──
+            if has_any_rope:
+                cached = buf[rope_pub]  # bf16 gather, one allocation
+                k_pe_old = cached[..., kv_lora_rank:].contiguous()
+                if _dummy_rope is None or _dummy_rope.shape != k_pe_old.shape:
+                    _dummy_rope = torch.zeros_like(k_pe_old)
+                _, k_pe_new = rotary_emb(rope_delta, _dummy_rope, k_pe_old)
+                # In-place k_pe update on the gathered tensor (still bf16),
+                # then scatter. Skips the redundant torch.cat + .to() round-trip.
+                cached[..., kv_lora_rank:] = k_pe_new.to(cached.dtype)
+                buf[rope_priv] = cached
+
+        # DSA index-K prepopulation: page-level copy (unchanged; already bf16-safe).
+        # 关键修复：DSA index-K buffer 是 *page 布局* —— shape (num_pages, page_bytes)，
+        # 第一维是 page 索引(≈num_slots/page_size)，不是 token slot 索引！
+        # 段已 64 对齐 → 命中段 slot 都是整 page，可安全提取 page 索引做整页复制。
+        try:
+            ps = self.token_to_kv_pool.page_size
+            if ps > 1:
+                if pub_slots.numel() % ps == 0 and priv_slots.numel() % ps == 0:
+                    pub_pages = (pub_slots[::ps] // ps).long()
+                    priv_pages = (priv_slots[::ps] // ps).long()
+                    for layer_id in range(self.start_layer, self.end_layer):
+                        dsa_buf = self.token_to_kv_pool.get_index_k_with_scale_buffer(  # type: ignore[union-attr]
+                            layer_id=layer_id
+                        )
+                        dsa_buf[priv_pages] = dsa_buf[pub_pages]
+            else:
+                for layer_id in range(self.start_layer, self.end_layer):
+                    dsa_buf = self.token_to_kv_pool.get_index_k_with_scale_buffer(  # type: ignore[union-attr]
+                        layer_id=layer_id
+                    )
+                    dsa_buf[priv_slots] = dsa_buf[pub_slots]
+        except (AttributeError, TypeError):
+            pass  # DSA index-K copy is best-effort
+
+    def _pic_writeback_mla_kv(self, forward_batch: "ForwardBatch") -> None:
+        """PIC transition_rope: copy MLA KV from private slots to public slots.
+
+        For miss-segment token positions (pic_public_out_loc >= 0), the model
+        has just written latent KV to the private slot (out_cache_loc[i]).
+        We copy that latent to the corresponding public slot so future cache
+        hits can load position-free K from there and re-apply RoPE.
+        """
+        kv_pool = self.token_to_kv_pool
+
+        # PIC writeback (all modes): copy fresh miss-segment K from priv slots
+        # to pub slots so future requests can hit the PIC cache. The pair
+        # (pic_public_out_loc, out_cache_loc) is aligned 1:1 by construction;
+        # -1 entries in pic_public_out_loc mark last-segment tokens which are
+        # never cached and are filtered out here.
+        #
+        # BUGFIX (pic_a3 new-path): the miss→public writeback must use the
+        # dedicated l2plus tensors built by
+        # _pic_a3_rewrite_req_to_token_pool_for_l2plus. Those are consumed here
+        # AFTER the model forward, but forward_extend ran the model on an
+        # _eager_fb_view COPY of forward_batch — so the rewrite's forward_batch
+        # mutations (and the layer-1 pic_public_out_loc swap) are gone on this
+        # original forward_batch. The rewrite therefore also stashes them on the
+        # shared req (reached via _reqs_ref); read them from there. Without this,
+        # any segment first cached under the new-path (a miss segment in a
+        # request that also has a hit) kept ZERO public KV, so reusing it later
+        # read zeros → garbage.
+        _a3_new = getattr(forward_batch, "pic_a3_new_path", False)
+        _a3_req = None
+        if _a3_new:
+            _reqs = getattr(forward_batch, "_reqs_ref", None)
+            _a3_req = _reqs[0] if _reqs else None
+            pub_loc = getattr(_a3_req, "pic_a3_l2plus_pub_out_loc", None)
+        else:
+            pub_loc = getattr(forward_batch, "pic_public_out_loc", None)
+        if pub_loc is not None:
+            out_loc = (
+                _a3_req.pic_a3_l2plus_out_cache_loc
+                if _a3_new
+                else forward_batch.out_cache_loc
+            )
+
+            # Ensure pub_loc and out_loc have the same length.  They may differ if
+            # attn_tp_scatter padded out_loc to a multiple of tp_size.
+            n = min(pub_loc.shape[0], out_loc.shape[0])
+            pub_loc = pub_loc[:n]
+            out_loc = out_loc[:n]
+
+            valid = pub_loc >= 0
+            if valid.any():
+                pub_slots = pub_loc[valid]       # (n_miss,)
+                priv_slots = out_loc[valid]      # (n_miss,)
+                for layer_id in range(self.start_layer, self.end_layer):
+                    buf = kv_pool.get_key_buffer(layer_id)  # (total_slots, kv_dim)
+                    buf[pub_slots] = buf[priv_slots]
+
+    # ========================================================================
+    # PIC + A³/CacheBlend new-path helpers (v1)
+    # See scripts/pic_a3_full_recompute_plan.md §3.4, §3.6, §3.10.
+    # ========================================================================
+    def _pic_a3_pick_imp(self, forward_batch: "ForwardBatch") -> torch.Tensor:
+        """Run A³ or CacheBlend imp selection using layer-1 latent stash.
+
+        Reads forward_batch.pic_a3_layer1_stash (set by forward_mla under
+        reuse_check_state=='checking'). For CacheBlend, also reads the
+        layer-1 latent from PICache-populated public slots via
+        pic_a3_hit_pub_slots. Sets forward_batch.pic_a3_imp_indices and
+        forward_batch.pic_a3_q_positions_l2plus_per_req.
+
+        v1: single-request batches only (aligned with _maybe_populate_reuse_fields).
+        """
+        assert forward_batch.batch_size == 1, (
+            "pic_a3 new-path v1 supports single-request batches only "
+            f"(got batch_size={forward_batch.batch_size})"
+        )
+        stash = forward_batch.pic_a3_layer1_stash
+        assert stash is not None, (
+            "pic_a3 layer-1 stash missing — forward_mla must run at "
+            "CHECK_LAYER=1 with reuse_check_state='checking' before this call"
+        )
+        # Single-layer (Phase A) imp selection from the layer-1 stash. The
+        # pic_a3_oracle mode does NOT go through here — it uses Phase B keepalive
+        # windowed re-selection (_pic_a3_keepalive_window), where the stash is
+        # already oracle-derived via _pic_a3_oracle_capture_or_inject.
+        imp_indices = self._pic_a3_select_from_stash(forward_batch, stash)
+        forward_batch.pic_a3_imp_indices = imp_indices
+        # Q positions for layer 2+ = miss ∪ imp, sorted ascending.
+        # NB: last_len covers ONLY the query region (last segment length,
+        # e.g. 64 for the Q segment in quick_test_online). miss positions
+        # like C2 (in the middle of the sequence) are NOT in last_indices —
+        # they must be added explicitly. imp_indices from pick_imp_latent_*
+        # only contains: topk(context) + last_indices(query region).
+        # So we need: imp_indices ∪ miss_positions.
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        import logging as _lg_union
+        import os as _os_union
+        _log_u = _lg_union.getLogger(__name__)
+
+        # DIAG: force imp = ALL positions (equivalent to full recompute at
+        # layer 2+). If output is still wrong, plumbing is broken; if correct,
+        # imp selection quality is the issue.
+        _force_all_imp = _os_union.environ.get("PIC_A3_FORCE_ALL_IMP", "0") == "1"
+        # DIAG: only miss (no hit-imp). Layer 2+ processes just miss+Q, hit
+        # goes fully through prepop path. Tests if mixing fresh-imp K/V with
+        # prepop'd K/V at hit-adjacent positions causes score inconsistency.
+        _miss_only_imp = _os_union.environ.get("PIC_A3_MISS_ONLY_IMP", "0") == "1"
+
+        if reqs is not None and len(reqs) >= 1:
+            req = reqs[0]
+            _miss_segs = getattr(req, "pic_miss_segments", [])
+            _pic_segs = getattr(req, "pic_segments", None)
+            _hit_segs = getattr(req, "pic_hit_segments", None)
+            _log_u.warning(
+                f"[PIC-A3-UNION-DBG] rid={getattr(req, 'rid', '?')[:8]} "
+                f"reqs_len={len(reqs)} "
+                f"pic_segs={_pic_segs} "
+                f"pic_hit_segs_lens={[e - s for (s, e, _) in (_hit_segs or [])]} "
+                f"miss_segs={_miss_segs} imp_before={imp_indices.numel()} "
+                f"force_all={_force_all_imp}"
+            )
+            if _force_all_imp:
+                # Bypass: all positions become imp → layer 2+ processes
+                # everything → equivalent to full recompute at layer 2+
+                full_len = int(getattr(req, "pic_a3_full_len", imp_indices.numel()))
+                imp_indices = torch.arange(
+                    0, full_len,
+                    dtype=imp_indices.dtype, device=imp_indices.device,
+                )
+                forward_batch.pic_a3_imp_indices = imp_indices
+                _log_u.warning(
+                    f"[PIC-A3-UNION-DBG] FORCED all imp = {full_len}"
+                )
+            elif _miss_only_imp:
+                # Bypass: imp = only miss positions (no topk from hit).
+                # Layer 2+ processes just miss tokens; hit positions ALL go
+                # through prepop path. Isolates whether mixing fresh vs prepop'd
+                # at hit positions causes attention inconsistency.
+                miss_positions = []
+                for (s, e) in _miss_segs:
+                    miss_positions.extend(range(s, e))
+                if miss_positions:
+                    imp_indices = torch.tensor(
+                        miss_positions, dtype=imp_indices.dtype,
+                        device=imp_indices.device,
+                    ).sort()[0]
+                    forward_batch.pic_a3_imp_indices = imp_indices
+                _log_u.warning(
+                    f"[PIC-A3-UNION-DBG] MISS_ONLY imp = {imp_indices.numel()}"
+                )
+            else:
+                miss_positions = []
+                for (s, e) in _miss_segs:
+                    miss_positions.extend(range(s, e))
+                if miss_positions:
+                    miss_pos_tensor = torch.tensor(
+                        miss_positions, dtype=imp_indices.dtype,
+                        device=imp_indices.device,
+                    )
+                    imp_indices = torch.unique(
+                        torch.cat([imp_indices, miss_pos_tensor])
+                    )
+                    forward_batch.pic_a3_imp_indices = imp_indices
+                    _log_u.warning(
+                        f"[PIC-A3-UNION-DBG] added {len(miss_positions)} miss pos, "
+                        f"imp_after={imp_indices.numel()}"
+                    )
+                else:
+                    _log_u.warning(
+                        "[PIC-A3-UNION-DBG] no miss positions to add"
+                    )
+        else:
+            _log_u.warning(
+                f"[PIC-A3-UNION-DBG] reqs is None or empty: reqs={reqs}"
+            )
+
+        # PIC_A3_FORCE_HIT_HEAD_IMP=N: force the first N tokens of every hit
+        # segment into imp at the layer-1 boundary too. Needed because
+        # PIC_A3_CLIP_REAL_L1=1 (now default) routes layer 1 through pick_imp,
+        # which bypasses _pic_a3_apply_imp_diag_env (where the deep check layers
+        # apply the same head-force). Mirrors that helper. Default 0 = zero
+        # regression.
+        _hit_head = int(os.environ.get("PIC_A3_FORCE_HIT_HEAD_IMP", "0") or "0")
+        if _hit_head > 0 and reqs is not None and len(reqs) >= 1:
+            _hit_segs = getattr(reqs[0], "pic_hit_segments", None) or []
+            _full_hh = int(getattr(reqs[0], "pic_a3_full_len", imp_indices.numel()))
+            _heads = []
+            for (s, e, _h) in _hit_segs:
+                _end = min(int(s) + _hit_head, int(e), _full_hh)
+                _heads.extend(range(int(s), _end))
+            if _heads:
+                _ht = torch.tensor(
+                    _heads, dtype=imp_indices.dtype, device=imp_indices.device
+                )
+                imp_indices = torch.unique(torch.cat([imp_indices, _ht]))
+                forward_batch.pic_a3_imp_indices = imp_indices
+                _log_u.warning(
+                    f"[PIC-A3-FORCE-HIT-HEAD] (pick_imp L1) N={_hit_head} "
+                    f"hit_segs={len(_hit_segs)} forced={len(_heads)} "
+                    f"imp_now={imp_indices.numel()} full_len={_full_hh}"
+                )
+
+        # === DIAGNOSTIC: log imp distribution per pic segment ===
+        import logging as _lg
+        _log = _lg.getLogger(__name__)
+        try:
+            reqs_diag = getattr(forward_batch, "_reqs_ref", None)
+            if reqs_diag is not None and len(reqs_diag) >= 1:
+                _req_diag = reqs_diag[0]
+                _imp_set = set(int(x) for x in imp_indices.tolist())
+                _dist = []
+                for (s, e) in getattr(_req_diag, "pic_segments", []):
+                    _in_seg = sum(1 for p in range(s, e) if p in _imp_set)
+                    _dist.append(f"[{s},{e})={_in_seg}/{e-s}")
+                _log.warning(
+                    f"[PIC-A3-IMP-DIST] total imp={imp_indices.numel()} "
+                    f"segs: {' '.join(_dist)}"
+                )
+                # Full imp position list — parsed by test/manual/pic_a3_imp_token_view.py.
+                # Format: `[PIC-A3-IMP-LIST] rid=<8char> reuse=<method> N=<n_full> `
+                # `last_len=<int> prefix_len=<int> n_imp=<int> positions=<comma-ints>`.
+                # Emitted as a single WARNING line so the client script can regex out
+                # positions and decode them via the tokenizer.
+                _rid_short = getattr(_req_diag, "rid", "?")[:8]
+                _pos_csv = ",".join(str(int(x)) for x in imp_indices.tolist())
+                _log.warning(
+                    f"[PIC-A3-IMP-LIST] rid={_rid_short} "
+                    f"reuse={forward_batch.reuse_method or '?'} "
+                    f"N={int(getattr(_req_diag, 'pic_a3_full_len', imp_indices.numel()))} "
+                    f"last_len={_last_len} prefix_len={prefix_len} "
+                    f"n_imp={imp_indices.numel()} positions={_pos_csv}"
+                )
+        except Exception:
+            pass
+
+        forward_batch.pic_a3_q_positions_l2plus_per_req = [imp_indices]
+
+        # Free the stash — no longer needed after layer 1
+        forward_batch.pic_a3_layer1_stash = None
+        return imp_indices
+
+    def _pic_a3_select_from_stash(
+        self, forward_batch: "ForwardBatch", stash: dict, layer_id: Optional[int] = None
+    ) -> torch.Tensor:
+        """Core A³/CacheBlend imp selection from a single check-layer stash.
+
+        Returns raw imp_indices (topk(context) ∪ query-region) BEFORE the
+        miss-union. Shared by _pic_a3_pick_imp (real, layer-1 boundary) and
+        _pic_a3_pick_imp_probe (read-only, other check layers in Phase A).
+        """
+        from sglang.srt.models.reuse_utils import (
+            pick_imp_latent_a3,
+            pick_imp_latent_a3_hit_only,
+            pick_imp_latent_blend,
+            read_layer_latent_from_pic_public,
+            REUSE_A3,
+            REUSE_BLEND,
+        )
+
+        # last_len defaults to miss_len (query region always kept as imp).
+        _last_len = forward_batch.reuse_last_len
+        if _last_len is None:
+            req = self.req_pool[0] if hasattr(self, "req_pool") else None
+            _last_len = int(getattr(req, "pic_a3_miss_len", 0)) if req else 0
+            assert _last_len > 0, "cannot determine last_len for pic_a3 imp pick"
+
+        recomp_ratio = float(forward_batch.recomp_ratio or 0.15)
+        prefix_len = int(forward_batch.reuse_prefix_len or 0)
+
+        reuse_method = forward_batch.reuse_method or ""
+        # Per-segment imp budget when HIT_ONLY_IMP (always) or HYBRID_IMP at a
+        # DEEP reselect layer (layer_id > 1). Global top-k otherwise (layer 1 in
+        # hybrid → concentrate budget on the answer chunk). See env docstrings.
+        _use_hit_only = envs.SGLANG_PIC_A3_HIT_ONLY_IMP.get() or (
+            envs.SGLANG_PIC_A3_HYBRID_IMP.get()
+            and layer_id is not None
+            and int(layer_id) > 1
+        )
+        if REUSE_A3 in reuse_method:
+            if _use_hit_only:
+                # Restrict topk to hit-segment positions with per-segment budget.
+                _reqs_hit = getattr(forward_batch, "_reqs_ref", None)
+                _hit_segs_raw = []
+                if _reqs_hit is not None and len(_reqs_hit) >= 1:
+                    _hit_segs_raw = getattr(_reqs_hit[0], "pic_hit_segments", []) or []
+                _hit_segs = [(int(s), int(e)) for (s, e, *_rest) in _hit_segs_raw]
+                imp_indices = pick_imp_latent_a3_hit_only(
+                    q_absorbed=stash["q_absorbed"],
+                    k_latent=stash["k_latent"],
+                    q_pe=stash["q_pe"],
+                    k_pe=stash["k_pe"],
+                    softmax_scale=stash["softmax_scale"],
+                    last_len=_last_len,
+                    recomp_ratio=recomp_ratio,
+                    hit_segments=_hit_segs,
+                    prefix_len=prefix_len,
+                )
+            else:
+                imp_indices = pick_imp_latent_a3(
+                    q_absorbed=stash["q_absorbed"],
+                    k_latent=stash["k_latent"],
+                    q_pe=stash["q_pe"],
+                    k_pe=stash["k_pe"],
+                    softmax_scale=stash["softmax_scale"],
+                    last_len=_last_len,
+                    recomp_ratio=recomp_ratio,
+                    prefix_len=prefix_len,
+                )
+        elif REUSE_BLEND in reuse_method:
+            # CacheBlend: need latent_old from PIC public cache
+            hit_pub = forward_batch.pic_a3_hit_pub_slots
+            assert hit_pub is not None, (
+                "pic_cacheblend new-path needs pic_a3_hit_pub_slots on "
+                "forward_batch (set by pic_alloc); got None"
+            )
+            layer_id = int(stash["layer_id"])
+            kv_buf = self.token_to_kv_pool.get_key_buffer(layer_id)  # (slots, 1, D)
+            latent_old = read_layer_latent_from_pic_public(kv_buf, hit_pub)
+            latent_new = torch.cat([stash["k_latent"], stash["k_pe"]], dim=-1)
+            imp_indices = pick_imp_latent_blend(
+                latent_new=latent_new,
+                latent_old=latent_old,
+                kv_lora_rank=int(stash["kv_lora_rank"]),
+                last_len=_last_len,
+                recomp_ratio=recomp_ratio,
+                prefix_len=prefix_len,
+            )
+        else:
+            raise ValueError(
+                f"pic_a3 unknown reuse_method: '{reuse_method}' "
+                f"(expected substring '{REUSE_A3}' or '{REUSE_BLEND}')"
+            )
+        return imp_indices
+
+    def _pic_a3_union_miss(
+        self, forward_batch: "ForwardBatch", imp_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Union imp_indices with all miss positions (read-only; no fb mutation).
+
+        Mirrors the plain-union branch of _pic_a3_pick_imp without the
+        diagnostic env overrides. Used by the Phase-A probe.
+        """
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        if not reqs:
+            return imp_indices
+        _miss_segs = getattr(reqs[0], "pic_miss_segments", []) or []
+        miss_positions = []
+        for (s, e) in _miss_segs:
+            miss_positions.extend(range(int(s), int(e)))
+        if not miss_positions:
+            return imp_indices
+        miss_pos_tensor = torch.tensor(
+            miss_positions, dtype=imp_indices.dtype, device=imp_indices.device
+        )
+        return torch.unique(torch.cat([imp_indices, miss_pos_tensor]))
+
+    def _pic_a3_pick_imp_probe(
+        self, forward_batch: "ForwardBatch", layer_id: int
+    ) -> None:
+        """Phase-A read-only probe: run imp selection from the stash saved at
+        `layer_id`, union with miss, and log the result + overlap with the
+        applied layer-1 imp set. Does NOT mutate the applied selection.
+
+        NB (Phase-A limitation): the production clip at the layer-1 boundary
+        drops non-imp tokens, so a stash saved at layer>1 spans only the
+        surviving (miss+imp) rows — this probe re-ranks within that set, not the
+        full sequence. Full-sequence multi-layer selection is Phase B.
+        """
+        import logging as _lg
+
+        _log = _lg.getLogger(__name__)
+        stash_by_layer = getattr(forward_batch, "pic_a3_stash_by_layer", None)
+        stash = stash_by_layer.get(int(layer_id)) if stash_by_layer else None
+        if stash is None:
+            return
+        try:
+            imp = self._pic_a3_select_from_stash(forward_batch, stash)
+            imp = self._pic_a3_union_miss(forward_batch, imp)
+        except Exception as _e:  # probe must never break the forward
+            _log.warning(f"[PIC-A3-PROBE] layer={layer_id} selection failed: {_e}")
+            return
+        applied = getattr(forward_batch, "pic_a3_imp_indices", None)
+        overlap = -1
+        if applied is not None:
+            _a = set(int(x) for x in applied.tolist())
+            _b = set(int(x) for x in imp.tolist())
+            overlap = len(_a & _b)
+        _log.warning(
+            f"[PIC-A3-PROBE] layer={layer_id} imp={int(imp.numel())} "
+            f"overlap_l1={overlap} "
+            f"applied_l1={int(applied.numel()) if applied is not None else -1}"
+        )
+
+    def _pic_a3_prepop_hit_slots_for_l2plus(
+        self,
+        forward_batch: "ForwardBatch",
+        layer_start: Optional[int] = None,
+        layer_end: Optional[int] = None,
+        exclude_positions: Optional[set] = None,
+    ) -> None:
+        """Populate KV buffers at hit-position l01_scratch slots with
+        delta-RoPE-corrected public cache values.
+
+        Layer 0-1 wrote FRESH KV to l01_scratch slots (correct for those
+        layers). Layer 2+ needs KV for hit-non-imp positions too, but doesn't
+        recompute them. This method fills those buffers at those slot indices
+        with the correct KV — same delta-RoPE trick as _pic_prepopulate_hit_slots
+        but only for hit-position slots (not miss).
+
+        Args (all optional — defaults reproduce the production single-boundary
+        behavior, i.e. layers [2, N) over ALL hit positions):
+          layer_start / layer_end: layer range [start, end) to fill. Phase B
+            keep-alive passes a per-window range [check_layer+1, next_check).
+          exclude_positions: set of positions to SKIP (the imp positions, which
+            get fresh KV, not cached). Phase B keep-alive passes the current
+            window's imp set so only NON-imp hit positions get cached.
+
+        Called after _pic_a3_rewrite_req_to_token_pool_for_l2plus (production),
+        or from _pic_a3_keepalive_window per window (Phase B).
+        """
+        # Get the single req for v1
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        assert reqs is not None and len(reqs) == 1
+        req = reqs[0]
+
+        # Collect flat (pub, priv, delta) tensors across all hit segments.
+        # `priv_slots` here is the l01_scratch slice for the hit segment
+        # (set in pic_alloc's pic_a3 branch to l01_slice.clone()).
+        _pub_pieces: List[torch.Tensor] = []
+        _priv_pieces: List[torch.Tensor] = []
+        _delta_pieces: List[torch.Tensor] = []
+        device = self.token_to_kv_pool.get_key_buffer(self.start_layer).device
+        for (s, e), hit_info in req.pic_rope_hit_private_slots.items():
+            priv_slots, pub_kv_slots, old_start = hit_info
+            seg_len = e - s
+            if exclude_positions is None:
+                _keep = None
+            else:
+                _keep = [p - s for p in range(s, e) if p not in exclude_positions]
+                if not _keep:
+                    continue
+            _pub = pub_kv_slots[:seg_len].to(device, non_blocking=True)
+            _priv = priv_slots[:seg_len].to(device, non_blocking=True)
+            _dlt = torch.full(
+                (seg_len,), s - old_start, dtype=torch.int64, device=device
+            )
+            if _keep is not None:
+                _kt = torch.tensor(_keep, dtype=torch.long, device=device)
+                _pub, _priv, _dlt = _pub[_kt], _priv[_kt], _dlt[_kt]
+            _pub_pieces.append(_pub)
+            _priv_pieces.append(_priv)
+            _delta_pieces.append(_dlt)
+        if not _pub_pieces:
+            return
+        pub_slots = torch.cat(_pub_pieces)
+        priv_slots = torch.cat(_priv_pieces)
+        delta_pos = torch.cat(_delta_pieces)
+
+        # Find rotary_emb (same pattern as _pic_prepopulate_hit_slots)
+        rotary_emb = None
+        for module in self.model.modules():
+            if hasattr(module, "rotary_emb") and module.rotary_emb is not None:
+                rotary_emb = module.rotary_emb
+                break
+        kv_lora_rank = getattr(self.model_config, "kv_lora_rank", None)
+        need_rope = (
+            rotary_emb is not None
+            and delta_pos is not None
+            and kv_lora_rank is not None
+        )
+
+        if need_rope:
+            rope_mask = delta_pos != 0
+            has_any_rope = bool(rope_mask.any())
+            has_any_direct = bool((~rope_mask).any())
+            if has_any_rope:
+                rope_pub  = pub_slots[rope_mask]
+                rope_priv = priv_slots[rope_mask]
+                rope_delta = delta_pos[rope_mask]
+            if has_any_direct:
+                direct_pub  = pub_slots[~rope_mask]
+                direct_priv = priv_slots[~rope_mask]
+            _dummy_rope: Optional[torch.Tensor] = None
+        else:
+            has_any_rope = False
+            has_any_direct = True
+            direct_pub, direct_priv = pub_slots, priv_slots
+
+        # Layer range: default [2, N) (production); Phase B keep-alive passes a
+        # per-window sub-range. Layers 0-1 are skipped by default (fresh KV).
+        _reuse_check_layer = 1  # aligned with reuse_utils.CHECK_LAYER
+        start_layer_l2plus = (
+            layer_start if layer_start is not None
+            else max(self.start_layer, _reuse_check_layer + 1)
+        )
+        _end_layer_l2plus = layer_end if layer_end is not None else self.end_layer
+        for layer_id in range(start_layer_l2plus, _end_layer_l2plus):
+            buf = self.token_to_kv_pool.get_key_buffer(layer_id)
+
+            if has_any_direct:
+                buf[direct_priv] = buf[direct_pub]
+
+            if has_any_rope:
+                cached = buf[rope_pub]
+                k_pe_old = cached[..., kv_lora_rank:].contiguous()
+                if _dummy_rope is None or _dummy_rope.shape != k_pe_old.shape:
+                    _dummy_rope = torch.zeros_like(k_pe_old)
+                _, k_pe_new = rotary_emb(rope_delta, _dummy_rope, k_pe_old)
+                cached[..., kv_lora_rank:] = k_pe_new.to(cached.dtype)
+                buf[rope_priv] = cached
+
+        # DSA index-K prepopulation for layers 2..N-1 (same page trick as
+        # _pic_prepopulate_hit_slots — best-effort, wrapped in try/except).
+        try:
+            ps = self.token_to_kv_pool.page_size
+            if ps > 1 and pub_slots.numel() % ps == 0 and priv_slots.numel() % ps == 0:
+                pub_pages = (pub_slots[::ps] // ps).long()
+                priv_pages = (priv_slots[::ps] // ps).long()
+                for layer_id in range(start_layer_l2plus, _end_layer_l2plus):
+                    dsa_buf = self.token_to_kv_pool.get_index_k_with_scale_buffer(  # type: ignore[union-attr]
+                        layer_id=layer_id
+                    )
+                    dsa_buf[priv_pages] = dsa_buf[pub_pages]
+            elif ps <= 1:
+                for layer_id in range(start_layer_l2plus, _end_layer_l2plus):
+                    dsa_buf = self.token_to_kv_pool.get_index_k_with_scale_buffer(  # type: ignore[union-attr]
+                        layer_id=layer_id
+                    )
+                    dsa_buf[priv_slots] = dsa_buf[pub_slots]
+        except (AttributeError, TypeError):
+            pass
+
+    def _pic_a3_oracle_capture_or_inject(
+        self,
+        forward_batch: "ForwardBatch",
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        positions: Optional[torch.Tensor] = None,
+    ):
+        """pic_a3_oracle (SGLANG_PIC_A3_ORACLE) in-process capture + inject.
+
+        Called at each Phase B check layer, BEFORE the layer runs, so the layer
+        computes Q/K/V from the (possibly oracle-replaced) input hidden state.
+
+        The residual stream entering this layer == hidden_states + residual (the
+        fused add-RMSNorm input_layernorm sums them). So:
+          • CAPTURE (warmup, isolated): the FIRST time a document segment is
+            computed fresh (it is a MISS with no stored hidden yet), stash its
+            per-layer input residual stream, keyed by PIC segment hash. Under the
+            warmup-first flow (pic_w1/w2/w3 each carry ONE document) this is the
+            segment's isolated-context representation. The last (query) segment
+            is never captured.
+          • INJECT (measure): for each HIT document segment with a stored hidden,
+            overwrite its layer input with the isolated-warmup value
+            (hidden_states[seg]=oracle_rs, residual[seg]=0 → input_layernorm sees
+            residual+hidden == oracle_rs). The layer then re-picks imp and
+            recomputes imp KV from accurate (undrifted) input (做法 1).
+
+        Returns (hidden_states, residual), modified in place for injected
+        segments. No-op (returns inputs unchanged) unless the oracle flag is on,
+        the batch is single-request, and residual is present (layer >= 1).
+        """
+        if not envs.SGLANG_PIC_A3_ORACLE.get():
+            return hidden_states, residual
+        if residual is None or not torch.is_tensor(hidden_states):
+            return hidden_states, residual
+        if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+            # MLP all-reduce is fused into the NEXT layer's input_layernorm, so
+            # hidden_states here is a pre-all-reduce partial and
+            # hidden_states+residual is NOT the materialized residual stream —
+            # capturing/injecting it would be wrong. pic_a3_oracle runs with
+            # --disable-cuda-graph where this fusion is off, so this is a
+            # defensive skip (degrades to plain keepalive at this layer).
+            import logging as _lg_orf
+
+            _lg_orf.getLogger(__name__).warning(
+                f"[PIC-A3-ORACLE] layer={int(layer_id)} skipped: MLP allreduce "
+                f"fusion active (residual stream not materialized)"
+            )
+            return hidden_states, residual
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        if not reqs or len(reqs) != 1:
+            return hidden_states, residual
+        req = reqs[0]
+
+        from sglang.srt.pic.hasher import segment_hash
+
+        store = getattr(self, "_pic_a3_oracle_hidden", None)
+        if store is None:
+            store = self._pic_a3_oracle_hidden = {}
+        L = int(layer_id)
+
+        # Residual stream entering this layer. Computed pre-inject; miss ∩ hit
+        # == ∅, so the miss slices read for capture are unaffected by the
+        # hit-slice inject below.
+        rs = hidden_states + residual
+
+        # Route-A: after the first clip the main-loop tensors are clip-local
+        # (rows = miss∪imp', NOT full_len). Absolute segment coords [s:e] are then
+        # invalid, so INJECT/CAPTURE (indexed by abs coords) are skipped; only the
+        # positions-masked query-segment stash (valid either way) runs.
+        _full_len = int(getattr(req, "pic_a3_full_len", 0) or 0)
+        _is_clipped = _full_len > 0 and int(hidden_states.shape[0]) != _full_len
+
+        _last = req.pic_segments[-1] if getattr(req, "pic_segments", None) else None
+        input_ids = forward_batch.input_ids
+        # pic_a3_oracle Route-A: stash the query (last) segment's residual stream
+        # for clip-time full-length re-projection. positions-mask works whether
+        # hidden is full-length or clipped (positions carry abs values in both).
+        if _last is not None and envs.SGLANG_PIC_A3_CLIP_CAPTURE.get():
+            _qs, _qe = _last
+            # Use the LOCAL positions (matches current hidden rows; clipped after
+            # the first window). forward_batch.positions may be stale full-length.
+            _pos = positions if positions is not None else forward_batch.positions
+            if int(_pos.shape[0]) == int(rs.shape[0]):
+                _qmask = (_pos >= int(_qs)) & (_pos < int(_qe))
+                if bool(_qmask.any()):
+                    forward_batch._pic_a3_last_seg_rs = rs[_qmask].detach().clone()
+
+        # ── INJECT: hit segments → isolated-warmup oracle hidden (full-len only) ──
+        n_inj = 0
+        _inj_dbg = []       # (s,e,hash4) injected
+        _inj_nostore = []   # (s,e,hash4) hit seg but no stored oracle at this layer
+        _inj_shape = []     # (s,e,hash4) stored but length mismatch
+        if not _is_clipped:
+            for (s, e, seg_hash) in getattr(req, "pic_hit_segments", None) or []:
+                _h4 = seg_hash.hex()[:4]
+                per_layer = store.get(seg_hash)
+                oracle_rs = per_layer.get(L) if per_layer is not None else None
+                if oracle_rs is None:
+                    _inj_nostore.append((s, e, _h4))
+                    continue
+                if int(oracle_rs.shape[0]) != int(e - s):
+                    _inj_shape.append((s, e, _h4))
+                    continue
+                hidden_states[s:e] = oracle_rs.to(hidden_states.dtype)
+                residual[s:e] = 0
+                n_inj += 1
+                _inj_dbg.append((s, e, _h4))
+
+        # ── CAPTURE: first-seen miss document segments (isolated) ──
+        n_cap = 0
+        _cap_dbg = []       # (s,e,hash4) captured
+        _cap_present = []   # (s,e,hash4) miss seg already stored at this layer
+        _cap_miss = [] if _is_clipped else (getattr(req, "pic_miss_segments", None) or [])
+        for (s, e) in _cap_miss:
+            if _last is not None and (s, e) == _last:
+                continue  # never capture the query (last) segment
+            seg_hash = segment_hash(input_ids[s:e])
+            _h4 = seg_hash.hex()[:4]
+            per_layer = store.setdefault(seg_hash, {})
+            if L in per_layer:
+                _cap_present.append((s, e, _h4))
+                continue  # capture-if-absent: keep the first (isolated) copy
+            per_layer[L] = rs[s:e].detach().clone()
+            n_cap += 1
+            _cap_dbg.append((s, e, _h4))
+
+        # Route-A: also capture HIT segments (capture-if-absent) so SYS and any
+        # segment that is a hit at warmup (never a miss → skipped by the loop
+        # above) still gets a stored isolated hidden. Reads pre-inject rs. Gated
+        # on the clip flag → zero effect on the existing full-length keepalive.
+        if envs.SGLANG_PIC_A3_CLIP_CAPTURE.get() and not _is_clipped:
+            for (s, e, seg_hash) in getattr(req, "pic_hit_segments", None) or []:
+                if _last is not None and (s, e) == (_last[0], _last[1]):
+                    continue
+                per_layer = store.setdefault(seg_hash, {})
+                if L in per_layer:
+                    continue
+                per_layer[L] = rs[s:e].detach().clone()
+                n_cap += 1
+                _cap_dbg.append((s, e, seg_hash.hex()[:4]))
+
+        # DIAG (rank 0 only): full per-segment breakdown so we can see why some
+        # hit segments aren't injected (noStore / shapeBad) and what warmup
+        # captured. Remove once 4/4 coverage is confirmed.
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+        )
+
+        if (n_inj or n_cap or _inj_nostore or _inj_shape) and (
+            get_tensor_model_parallel_rank() == 0
+        ):
+            import logging as _lg_orc
+
+            _hit = [
+                (s, e, h.hex()[:4])
+                for (s, e, h) in (getattr(req, "pic_hit_segments", None) or [])
+            ]
+            _miss = list(getattr(req, "pic_miss_segments", None) or [])
+            _lg_orc.getLogger(__name__).warning(
+                f"[PIC-A3-ORACLE] layer={L} injected={n_inj} captured={n_cap} | "
+                f"segs={getattr(req, 'pic_segments', None)} hit={_hit} miss={_miss} "
+                f"| cap={_cap_dbg} capPresent={_cap_present} inj={_inj_dbg} "
+                f"noStore={_inj_nostore} shapeBad={_inj_shape} "
+                f"storeKeys={len(store)}"
+            )
+        return hidden_states, residual
+
+    def _pic_a3_apply_imp_diag_env(
+        self, imp_set: set, full_len: int, layer_id: int, forward_batch=None
+    ) -> set:
+        """Apply pic_a3 imp diagnostic env overrides (shared by keepalive_window
+        and Route-A reselect). PIC_A3_FORCE_ALL_IMP → all positions imp (all
+        fresh, no cached-K). PIC_A3_KEEPALIVE_FIXED_IMP → every check layer reuses
+        the layer-1 imp split (no per-layer re-select).
+        PIC_A3_FORCE_HIT_HEAD_IMP=N → force the FIRST N tokens of EVERY hit
+        segment into imp (recomputed fresh from the in-context input), so each
+        reused doc segment's head is never served from isolated cached-K — targets
+        the isolated-K vs in-context-hidden mismatch that collapses the oracle on
+        multi-doc data. N is clamped per segment (short segs forced whole) and
+        should be a multiple of the 64 page size (128 in experiments). Applies at
+        EVERY check layer incl. layer 1: on the default oracle run both
+        _pic_a3_oracle_reselect_full and _pic_a3_keepalive_window route here.
+        Default 0=off (zero regression)."""
+        # Force the head of every HIT segment into imp (fresh recompute). Runs
+        # BEFORE the other overrides so the forced heads are also captured by
+        # KEEPALIVE_FIXED_IMP's layer-1 snapshot and survive FORCE_ALL_IMP.
+        _hit_head = int(os.environ.get("PIC_A3_FORCE_HIT_HEAD_IMP", "0") or "0")
+        if _hit_head > 0 and forward_batch is not None:
+            reqs = getattr(forward_batch, "_reqs_ref", None)
+            if reqs and len(reqs) >= 1:
+                _hit_segs = getattr(reqs[0], "pic_hit_segments", None) or []
+                imp_set = set(imp_set)
+                _forced = 0
+                for (s, e, _h) in _hit_segs:
+                    _end = min(int(s) + _hit_head, int(e), int(full_len))
+                    for p in range(int(s), _end):
+                        imp_set.add(p)
+                        _forced += 1
+                if int(layer_id) == 1:
+                    import logging as _lg_fh
+
+                    _lg_fh.getLogger(__name__).warning(
+                        f"[PIC-A3-FORCE-HIT-HEAD] N={_hit_head} "
+                        f"hit_segs={len(_hit_segs)} forced={_forced} "
+                        f"imp_now={len(imp_set)} full_len={full_len}"
+                    )
+        if os.environ.get("PIC_A3_FORCE_ALL_IMP") == "1":
+            return set(range(int(full_len)))
+        if os.environ.get("PIC_A3_KEEPALIVE_FIXED_IMP") == "1":
+            if int(layer_id) == 1:
+                self._pic_a3_ka_fixed_imp = set(imp_set)
+            elif getattr(self, "_pic_a3_ka_fixed_imp", None) is not None:
+                return set(self._pic_a3_ka_fixed_imp)
+        return imp_set
+
+    def _pic_a3_oracle_reselect_full(self, forward_batch, layer_id, layer):
+        """pic_a3_oracle Route-A: re-select imp over the FULL sequence at check
+        layer L, independent of the clipped main-loop rows. Assembles a full-len
+        residual stream from the oracle capture (hit + miss-non-last segments via
+        store[seg_hash][L]) plus the per-forward query-segment stash, runs
+        input_layernorm → project_latent_qk_from_normed → pick_imp. Returns
+        (imp_full sorted abs positions, ok). ok=False (→ caller falls back to
+        full-length keepalive) if any required capture row is missing."""
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        if not reqs or len(reqs) != 1:
+            return None, False
+        req = reqs[0]
+        full_len = int(getattr(req, "pic_a3_full_len", 0))
+        store = getattr(self, "_pic_a3_oracle_hidden", None)
+        if full_len <= 0 or not store:
+            return None, False
+        L = int(layer_id)
+        device = forward_batch.input_ids.device
+        input_ids = forward_batch.input_ids
+        _last = req.pic_segments[-1] if getattr(req, "pic_segments", None) else None
+
+        def _bail(reason):
+            try:
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+
+                if get_tensor_model_parallel_rank() == 0:
+                    import logging as _lgb
+
+                    _lgb.getLogger(__name__).warning(
+                        f"[PIC-A3-RESELECT-BAIL] layer={L} reason={reason} "
+                        f"storeKeys={len(store)} hit={getattr(req,'pic_hit_segments',None)} "
+                        f"miss={getattr(req,'pic_miss_segments',None)}"
+                    )
+            except Exception:
+                pass
+            return None, False
+
+        rs_full = None
+        def _place(s, e, src):
+            nonlocal rs_full
+            if src is None or int(src.shape[0]) != int(e - s):
+                return False
+            if rs_full is None:
+                rs_full = src.new_empty((full_len, src.shape[-1]))
+            rs_full[s:e] = src.to(rs_full.dtype)
+            return True
+
+        # hit segments (3-tuple, hash carried) → capture[hash][L]
+        for (s, e, seg_hash) in getattr(req, "pic_hit_segments", None) or []:
+            per = store.get(seg_hash)
+            if not _place(s, e, per.get(L) if per is not None else None):
+                return _bail(f"hit_seg({s},{e})_L{L}_perNone={per is None}")
+        # miss segments: non-last → capture; last (query) → per-forward stash
+        from sglang.srt.pic.hasher import segment_hash
+
+        for (s, e) in getattr(req, "pic_miss_segments", None) or []:
+            if _last is not None and (s, e) == _last:
+                if not _place(s, e, getattr(forward_batch, "_pic_a3_last_seg_rs", None)):
+                    _lr = getattr(forward_batch, "_pic_a3_last_seg_rs", None)
+                    return _bail(f"lastseg({s},{e})_rs={None if _lr is None else tuple(_lr.shape)}")
+            else:
+                per = store.get(segment_hash(input_ids[s:e]))
+                if not _place(s, e, per.get(L) if per is not None else None):
+                    return _bail(f"miss_seg({s},{e})_L{L}_perNone={per is None}")
+        if rs_full is None:
+            return _bail("rs_full_None")
+
+        # ── K-dump 观测台: dump the reconstructed FULL-LENGTH residual stream
+        # rs_full — what oracle's deep re-selection actually uses at this check
+        # layer, assembled from the isolated store — for ALL positions (incl. every
+        # doc segment, "全有的"). Compared offline vs full_recompute's true hidden.
+        # Gated by SGLANG_PIC_KDUMP_RS=1 (no _ALL needed). bf16, only check layers.
+        try:
+            import os as _os_rs
+
+            if (
+                _os_rs.environ.get("SGLANG_PIC_KDUMP_DIR", "")
+                and _os_rs.environ.get("SGLANG_PIC_KDUMP_RS", "0") == "1"
+            ):
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank as _tprk_rs,
+                )
+
+                if _tprk_rs() == 0:
+                    _rsd = _os_rs.environ["SGLANG_PIC_KDUMP_DIR"]
+                    _os_rs.makedirs(_rsd, exist_ok=True)
+                    _tag_rs = _os_rs.environ.get("SGLANG_PIC_KDUMP_TAG", "modeX")
+                    torch.save(
+                        {
+                            "h": rs_full.detach().to(torch.bfloat16).cpu(),
+                            "pos": torch.arange(int(full_len)),
+                        },
+                        f"{_rsd}/{_tag_rs}_RSFULL_L{int(L)}.pt",
+                    )
+        except Exception:
+            pass
+
+        normed = layer.input_layernorm(rs_full)
+        if isinstance(normed, tuple):
+            normed = normed[0]
+        positions_full = torch.arange(full_len, device=device, dtype=torch.long)
+        stash = layer.self_attn.project_latent_qk_from_normed(
+            normed, positions_full, forward_batch
+        )
+        imp = self._pic_a3_select_from_stash(forward_batch, stash, layer_id=L)
+        imp = self._pic_a3_union_miss(forward_batch, imp)
+        imp_set = set(int(x) for x in imp.tolist())
+        imp_set = self._pic_a3_apply_imp_diag_env(imp_set, full_len, L, forward_batch)
+        imp_full = torch.tensor(sorted(imp_set), dtype=torch.long, device=device)
+        forward_batch.pic_a3_imp_indices = imp_full
+        forward_batch.pic_a3_q_positions_l2plus_per_req = [imp_full]
+        return imp_full, True
+
+    def _pic_a3_rebuild_rowset_for_window(
+        self, forward_batch, layer_id, imp_new, h, r, pos, check_layers, num_layers,
+        topk=None,
+    ):
+        """pic_a3_oracle Route-A clip: rebuild the main-loop tensors from the
+        previous window's rowset to the new rowset (miss∪imp'). Kept rows are
+        gathered from the current h/r; NEW rows (dropped by a prior window but
+        re-selected now) are filled from the oracle capture (residual-stream:
+        hidden=oracle_rs, residual=0). Also resets req_to_token→l01, re-routes it
+        (rewrite), prepops non-imp cached K for the window, updates shape fields,
+        sets postchecking + rebuilds DSA metadata. Returns (h_new, r_new, pos_new).
+        """
+        req = forward_batch._reqs_ref[0]
+        full_len = int(req.pic_a3_full_len)
+        device = h.device
+        L = int(layer_id)
+        new_pos_list = [int(x) for x in imp_new.tolist()]
+        n_new = len(new_pos_list)
+        old_map = {int(p): i for i, p in enumerate(pos.tolist())}
+
+        # pos → (seg_hash, offset) for capture-fill of NEW rows. hit segs carry
+        # the hash; the query (last) seg uses the per-forward last-seg stash.
+        _last = req.pic_segments[-1] if getattr(req, "pic_segments", None) else None
+        store = getattr(self, "_pic_a3_oracle_hidden", None) or {}
+
+        h_new = h.new_empty((n_new, h.shape[-1]))
+        r_new = r.new_empty((n_new, r.shape[-1])) if r is not None else None
+        _need_cap = []  # (row_i, abs_pos)
+        _old_local = []  # per new row: index into the OLD rowset (0 for new rows)
+        for i, p in enumerate(new_pos_list):
+            oi = old_map.get(p)
+            _old_local.append(oi if oi is not None else 0)
+            if oi is not None:
+                h_new[i] = h[oi]
+                if r_new is not None:
+                    r_new[i] = r[oi]
+            else:
+                _need_cap.append((i, p))
+        for (i, p) in _need_cap:
+            src = None
+            for (s, e, seg_hash) in getattr(req, "pic_hit_segments", None) or []:
+                if s <= p < e:
+                    per = store.get(seg_hash)
+                    src = per.get(L) if per is not None else None
+                    if src is not None:
+                        src = src[p - s]
+                    break
+            if src is None and _last is not None and _last[0] <= p < _last[1]:
+                _lr = getattr(forward_batch, "_pic_a3_last_seg_rs", None)
+                src = _lr[p - _last[0]] if _lr is not None else None
+            if src is None:
+                # last resort: keep zeros (rare; logged by reselect coverage)
+                h_new[i] = 0
+            else:
+                h_new[i] = src.to(h_new.dtype)
+            if r_new is not None:
+                r_new[i] = 0  # residual stream folded into h_new (oracle_rs)
+        pos_new = imp_new.to(pos.dtype).to(device)
+
+        # reset req_to_token to l01 baseline, then re-route for miss∪imp'.
+        ridx = int(forward_batch.req_pool_indices[0].item())
+        l01 = req.pic_a3_l01_scratch_slots.to(device)
+        self.req_to_token_pool.req_to_token[ridx, :full_len] = l01
+        self._pic_a3_rewrite_req_to_token_pool_for_l2plus(forward_batch)
+
+        # window end = next check layer (or num_layers); prepop non-imp cached K.
+        _next = int(num_layers)
+        for cl in check_layers:
+            if int(cl) > L:
+                _next = int(cl)
+                break
+        self._pic_a3_prepop_hit_slots_for_l2plus(
+            forward_batch,
+            layer_start=L + 1,
+            layer_end=min(_next + 1, int(num_layers)),
+            exclude_positions=set(new_pos_list),
+        )
+
+        # shape fields (seq_lens unchanged — K pool full-len, invariant C).
+        forward_batch.extend_num_tokens = n_new
+        forward_batch.extend_seq_lens = torch.tensor(
+            [n_new], dtype=torch.int32, device=forward_batch.seq_lens.device
+        )
+        forward_batch.extend_seq_lens_cpu = [n_new]
+        forward_batch.out_cache_loc = forward_batch.pic_a3_l2plus_out_cache_loc
+        forward_batch.pic_public_out_loc = forward_batch.pic_a3_l2plus_pub_out_loc
+        forward_batch.reuse_check_state = "postchecking"
+        _ab = self.attn_backend
+        if hasattr(_ab, "reset_and_init_forward_metadata"):
+            _ab.reset_and_init_forward_metadata(forward_batch)
+        topk_new = None
+        if topk is not None:
+            topk_new = topk[
+                torch.tensor(_old_local, dtype=torch.long, device=topk.device)
+            ]
+        return h_new, r_new, pos_new, topk_new
+
+    def _pic_a3_keepalive_setup_miss_publish(self, forward_batch):
+        """Route-A/keepalive WARMUP fix: keepalive never calls the l2plus rewrite,
+        so req.pic_a3_l2plus_pub_out_loc stays unset and _pic_writeback_mla_kv
+        SKIPS publishing first-seen MISS document segments to the public cache —
+        the cached SegmentEntry then points at never-written (garbage) public
+        slots, so a later request that hits the segment reads garbage K. Build the
+        miss publish mapping (under keepalive routing miss==imp→real l01, so fresh
+        K lives at l01) so the existing writeback copies l01→public for all layers.
+        Idempotent per req; skips the query (last) segment (never cached)."""
+        req = forward_batch._reqs_ref[0]
+        if getattr(req, "_pic_a3_ka_miss_pub_done", False):
+            return
+        req._pic_a3_ka_miss_pub_done = True
+        full_len = int(getattr(req, "pic_a3_full_len", 0))
+        miss_slots = getattr(req, "pic_miss_segment_slots", None)
+        l01 = getattr(req, "pic_a3_l01_scratch_slots", None)
+        if not miss_slots or l01 is None or full_len <= 0:
+            return
+        _last = req.pic_segments[-1] if getattr(req, "pic_segments", None) else None
+        device = self.req_to_token_pool.req_to_token.device
+        l01 = l01.to(device)
+        _out, _pub = [], []
+        for (s, e), tup in miss_slots.items():
+            if _last is not None and (int(s), int(e)) == (int(_last[0]), int(_last[1])):
+                continue  # query segment is never cached
+            pub = tup[1].to(device)  # (seg_len,) public slots
+            for i, pos in enumerate(range(int(s), int(e))):
+                _out.append(int(l01[pos].item()))
+                _pub.append(int(pub[i].item()))
+        if not _out:
+            return
+        req.pic_a3_l2plus_out_cache_loc = torch.tensor(
+            _out, dtype=torch.long, device=device
+        )
+        req.pic_a3_l2plus_pub_out_loc = torch.tensor(
+            _pub, dtype=torch.long, device=device
+        )
+
+    def _pic_a3_keepalive_window(
+        self,
+        forward_batch: "ForwardBatch",
+        layer_id: int,
+        check_layers: list,
+        num_layers: int,
+        layer=None,
+    ) -> None:
+        """Phase B keep-all-alive per-window boundary (accuracy-ceiling probe).
+
+        Called after the forward of each A³ check layer. Re-selects imp from
+        THIS layer's FULL-sequence stash (all tokens are alive → true
+        multi-layer selection), then sets up KV routing for the window
+        [layer_id+1, next_check):
+          - out_cache_loc (full_len): imp -> real l01_scratch slot (fresh K
+            lands where req_to_token reads); non-imp -> throwaway slot in the
+            l2plus_imp pool (fresh K discarded).
+          - non-imp hit positions' real slots get delta-RoPE-corrected cached K
+            for the window's layers, so attention reads cached for them.
+        req_to_token stays stable (all positions -> l01_scratch) and the DSA
+        forward metadata (built once, full-length causal) is NOT rebuilt.
+        """
+        import logging as _lg
+
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        if not reqs or len(reqs) != 1:
+            return
+        req = reqs[0]
+        # Route-A/keepalive warmup fix: publish first-seen miss doc segments to
+        # the public cache (keepalive skips the l2plus rewrite → the default
+        # writeback never publishes them → cached SegmentEntry = garbage K).
+        self._pic_a3_keepalive_setup_miss_publish(forward_batch)
+        full_len = int(getattr(req, "pic_a3_full_len", 0))
+        if full_len <= 0:
+            return
+        device = self.req_to_token_pool.req_to_token.device
+
+        # 1. Select imp from this layer's full-sequence stash + union miss.
+        # Under pic_a3_oracle (SGLANG_PIC_A3_ORACLE) the hit segments' layer
+        # input was replaced with the isolated-warmup oracle hidden BEFORE this
+        # layer ran (_pic_a3_oracle_capture_or_inject), so this stash is already
+        # oracle-derived (accurate, undrifted Q·K) — no separate swap needed.
+        # Phase 0 (SGLANG_PIC_A3_CLIP_CAPTURE): re-select over the FULL sequence
+        # via oracle-capture re-projection (Route-A), replacing the clipped-stash
+        # select. Routing below is still full-length keepalive (no clip yet) — this
+        # isolates/validates the projection chain. reselect_full already applies
+        # the diag env and sets pic_a3_imp_indices.
+        _imp_full = None
+        if layer is not None and envs.SGLANG_PIC_A3_CLIP_CAPTURE.get():
+            _imp_full, _ok = self._pic_a3_oracle_reselect_full(
+                forward_batch, int(layer_id), layer
+            )
+            if not _ok:
+                _imp_full = None
+        if _imp_full is not None:
+            imp_set = set(int(x) for x in _imp_full.tolist())
+            # Phase-0 diagnostic: compare Route-A reselect vs the clipped-stash
+            # imp to validate the re-projection chain (rank 0 only).
+            _sbl = getattr(forward_batch, "pic_a3_stash_by_layer", None)
+            _st = _sbl.get(int(layer_id)) if _sbl else None
+            if _st is not None:
+                try:
+                    from sglang.srt.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank,
+                    )
+
+                    _si = self._pic_a3_union_miss(
+                        forward_batch,
+                        self._pic_a3_select_from_stash(
+                            forward_batch, _st, layer_id=int(layer_id)
+                        ),
+                    )
+                    _sset = set(int(x) for x in _si.tolist())
+                    _inter = len(imp_set & _sset)
+                    _uni = len(imp_set | _sset) or 1
+                    if get_tensor_model_parallel_rank() == 0:
+                        import logging as _lgov
+
+                        _lgov.getLogger(__name__).warning(
+                            f"[PIC-A3-RESELECT] layer={int(layer_id)} "
+                            f"reproj={len(imp_set)} stash={len(_sset)} "
+                            f"IoU={_inter/_uni:.3f} inter={_inter}"
+                        )
+                except Exception:
+                    pass
+        else:
+            stash_by_layer = getattr(forward_batch, "pic_a3_stash_by_layer", None)
+            stash = stash_by_layer.get(int(layer_id)) if stash_by_layer else None
+            if stash is None:
+                return
+            imp = self._pic_a3_select_from_stash(
+                forward_batch, stash, layer_id=int(layer_id)
+            )
+            imp = self._pic_a3_union_miss(forward_batch, imp)
+            imp_set = set(int(x) for x in imp.tolist())
+            imp_set = self._pic_a3_apply_imp_diag_env(
+                imp_set, int(full_len), int(layer_id), forward_batch
+            )
+            forward_batch.pic_a3_imp_indices = imp  # for logging / inspection
+
+        # 2. Window end = next check layer (or num_layers).
+        _next = int(num_layers)
+        for cl in check_layers:
+            if int(cl) > int(layer_id):
+                _next = int(cl)
+                break
+
+        # 3. Build full-length out_cache_loc: imp -> real, non-imp -> throwaway.
+        l01 = req.pic_a3_l01_scratch_slots.to(device)          # (full_len,) real slots
+        throwaway = req.pic_a3_l2plus_imp_slots_pool.to(device)  # (>=full_len,) keep-alive bump
+        assert throwaway.numel() >= full_len, (
+            f"keep-alive needs >= full_len throwaway slots; got "
+            f"{throwaway.numel()} < {full_len} (SGLANG_PIC_A3_KEEP_ALIVE must be "
+            f"set BEFORE pic_alloc so max_imp_len is bumped to full_len)"
+        )
+        out_loc = l01[:full_len].clone()
+        non_imp = [p for p in range(full_len) if p not in imp_set]
+        if non_imp:
+            _nip = torch.tensor(non_imp, dtype=torch.long, device=device)
+            out_loc[_nip] = throwaway[:full_len][_nip]
+        forward_batch.out_cache_loc = out_loc
+        forward_batch.pic_public_out_loc = torch.full(
+            (full_len,), -1, dtype=torch.long, device=device
+        )
+
+        # 4. Prepop cached K into NON-imp hit real slots.
+        # BUGFIX(2026-07-22 验证): range must INCLUDE the next check layer. The
+        # next check layer forwards BEFORE its own keepalive_window runs, so it
+        # still uses THIS window's out_cache_loc (non-imp -> throwaway). Without
+        # filling its l01 buffer here, buffer(next)[l01_non_imp] holds stale /
+        # garbage K -> attention reads garbage from layer 20/40/60 on -> FDT=0.
+        _prepop_end = min(int(_next) + 1, int(num_layers))
+        self._pic_a3_prepop_hit_slots_for_l2plus(
+            forward_batch,
+            layer_start=int(layer_id) + 1,
+            layer_end=_prepop_end,
+            exclude_positions=imp_set,
+        )
+
+        _lg.getLogger(__name__).warning(
+            f"[PIC-A3-WINDOW] layer={layer_id} next={_next} full_len={full_len} "
+            f"imp={len(imp_set)} non_imp={len(non_imp)}"
+        )
+
+    def _pic_a3_rewrite_req_to_token_pool_for_l2plus(
+        self, forward_batch: "ForwardBatch"
+    ) -> None:
+        """Rewrite req_to_token_pool between layer 1 and layer 2 so that
+        each position's slot pointer matches the layer-2+ K/V layout:
+            hit(non-imp) → PICache public slot
+            miss         → l2plus_miss_slot
+            imp          → l2plus_imp_slot
+
+        Preconditions:
+        - _pic_a3_pick_imp has run (forward_batch.pic_a3_imp_indices set)
+        - Per-req attributes pic_a3_l2plus_miss_slots / pic_a3_l2plus_imp_slots_pool
+          / pic_rope_hit_private_slots populated by pic_alloc
+
+        Also builds:
+        - forward_batch.pic_a3_l2plus_row_indices    — clip mask into full_len
+        - forward_batch.pic_a3_l2plus_out_cache_loc  — kernel write slot per row
+        - forward_batch.pic_a3_l2plus_pub_out_loc    — public writeback slot per row
+        """
+        # Get the single req for v1
+        req_pool_indices = forward_batch.req_pool_indices
+        assert req_pool_indices is not None and req_pool_indices.numel() == 1, (
+            f"pic_a3 v1 single-req only (got req_pool_indices={req_pool_indices})"
+        )
+        req_idx = int(req_pool_indices[0].item())
+
+        # Access schedule_batch.reqs via ForwardBatch._reqs_ref (set at
+        # ForwardBatch.init_new time — see forward_batch_info.py:749).
+        reqs = getattr(forward_batch, "_reqs_ref", None)
+        assert reqs is not None and len(reqs) == 1, (
+            "pic_a3 hook needs forward_batch._reqs_ref (single req in v1); "
+            f"got {reqs}"
+        )
+        req = reqs[0]
+
+        full_len = int(req.pic_a3_full_len)
+        imp_indices = forward_batch.pic_a3_imp_indices
+        assert imp_indices is not None
+
+        # Start from the current req_to_token_pool layout (l01_scratch slots
+        # at all positions — set by pic_alloc). We only redirect miss and
+        # hit-imp positions; hit-non-imp positions KEEP their l01_scratch
+        # slot index (same slot used at layer 0-1). Layer 2..N-1 buffers at
+        # those slots are populated by _pic_a3_prepop_hit_slots_for_l2plus
+        # with delta-RoPE-corrected public KV.
+        device = self.req_to_token_pool.req_to_token.device
+        new_slots = self.req_to_token_pool.req_to_token[
+            req_idx, :full_len
+        ].clone()
+
+        # 1. miss positions → l2plus_miss_slot (fresh KV, published to public)
+        # l2plus_miss_slice is stashed per-segment in a SEPARATE dict
+        # (pic_a3_l2plus_miss_slots_per_seg) to keep pic_miss_segment_slots
+        # tuple shape compatible with picache.py:283-286 unpacking.
+        _l2plus_miss_per_seg = getattr(
+            req, "pic_a3_l2plus_miss_slots_per_seg", {}
+        )
+        miss_position_set = set()
+        for (s, e) in req.pic_miss_segment_slots.keys():
+            miss_position_set.update(range(s, e))
+            l2plus_miss_slice = _l2plus_miss_per_seg.get((s, e))
+            if l2plus_miss_slice is None:
+                raise RuntimeError(
+                    f"pic_a3 rewrite: missing l2plus_miss slot for seg [{s},{e})"
+                )
+            for local_i, pos in enumerate(range(s, e)):
+                new_slots[pos] = l2plus_miss_slice[local_i].to(device)
+
+        # 2. hit-imp positions → l2plus_imp_slot (fresh KV, NOT published).
+        # These are hit-region positions selected as imp; layer 2+ recomputes
+        # their KV. The over-allocated pool (max_imp_len size) is consumed
+        # in imp_indices iteration order.
+        hit_imp_positions = [
+            int(p) for p in imp_indices.tolist() if int(p) not in miss_position_set
+        ]
+        l2plus_imp_pool = req.pic_a3_l2plus_imp_slots_pool
+        assert len(hit_imp_positions) <= l2plus_imp_pool.numel(), (
+            f"pic_a3 over-alloc insufficient: hit_imp={len(hit_imp_positions)} "
+            f"> max_imp_len pool size={l2plus_imp_pool.numel()}"
+        )
+        for i, pos in enumerate(hit_imp_positions):
+            new_slots[pos] = l2plus_imp_pool[i].to(device)
+
+        # Sanity: no -1 remaining (l01_scratch layout has no -1 by construction)
+        assert (new_slots >= 0).all(), (
+            f"pic_a3 rewrite: {(new_slots < 0).sum().item()} positions unassigned "
+            f"(full_len={full_len})"
+        )
+
+        # Write rewritten layout into req_to_token_pool
+        self.req_to_token_pool.req_to_token[req_idx, :full_len] = new_slots
+
+        # Build l2plus_row_indices, out_cache_loc, pub_out_loc — parallel arrays
+        # for the (miss+imp) Q rows (ascending position order matches
+        # pic_a3_q_positions_l2plus_per_req).
+        _q_pos = imp_indices  # already sorted ascending; contains miss ∪ imp
+        n_q = int(_q_pos.numel())
+
+        _out_cache_loc = torch.empty(n_q, dtype=torch.int64, device=device)
+        _pub_out_loc = torch.full((n_q,), -1, dtype=torch.int64, device=device)
+
+        # For each q row, look up the slot we just wrote to req_to_token_pool
+        _q_pos_dev = _q_pos.to(device)
+        _out_cache_loc[:] = new_slots[_q_pos_dev]
+
+        # Miss position writeback slots (from pic_a3_l2plus_miss_pub_slots,
+        # aligned with miss position order under pic_alloc). Fill only for
+        # miss (non-last) positions.
+        # v1 shortcut: only miss positions in the last segment (query region)
+        # in the typical test setup — that IS the last segment, so no writeback.
+        # Full correctness: iterate the miss segments in order and match up.
+        _miss_pub_slots = req.pic_a3_l2plus_miss_pub_slots  # (miss_non_last,)
+        if _miss_pub_slots.numel() > 0:
+            # Build a position→pub_slot map for miss-non-last positions
+            miss_pos_to_pub: dict = {}
+            _pub_off = 0
+            miss_segs = list(req.pic_miss_segment_slots.keys())
+            for _seg_i, (s, e) in enumerate(miss_segs):
+                is_last = (s, e) == req.pic_segments[-1]
+                if is_last:
+                    continue
+                seg_len = e - s
+                for local_i, pos in enumerate(range(s, e)):
+                    miss_pos_to_pub[pos] = int(_miss_pub_slots[_pub_off + local_i].item())
+                _pub_off += seg_len
+            # Fill _pub_out_loc for miss positions that need writeback
+            for row_i, pos in enumerate(_q_pos.tolist()):
+                p = int(pos)
+                if p in miss_pos_to_pub:
+                    _pub_out_loc[row_i] = miss_pos_to_pub[p]
+
+        forward_batch.pic_a3_l2plus_row_indices = _q_pos.to(device)
+        forward_batch.pic_a3_l2plus_out_cache_loc = _out_cache_loc
+        forward_batch.pic_a3_l2plus_pub_out_loc = _pub_out_loc
+        # Also persist the miss→public writeback tensors on the shared req.
+        # forward_extend runs the model on an _eager_fb_view COPY of
+        # forward_batch (dataclasses.replace under SGLANG_EAGER_INPUT_NO_COPY),
+        # so these forward_batch attribute mutations are LOST by the time the
+        # post-forward _pic_writeback_mla_kv runs on the original forward_batch.
+        # req (reached via _reqs_ref) IS shared with the copy, so stash the
+        # tensors here and have the writeback read them back from req.
+        req.pic_a3_l2plus_pub_out_loc = _pub_out_loc
+        req.pic_a3_l2plus_out_cache_loc = _out_cache_loc
+
+        # Per-Q kstart for layer 2+ segment-isolated attention. Gather from
+        # the per-position kstart tensor (built in schedule_batch per PIC
+        # segments): hit-segment imp Q gets its segment start, last-segment
+        # (query) miss Q gets 0. Same PIC/CacheBlend rule as layer 0-1.
+        _kstart_per_pos = getattr(
+            forward_batch, "pic_layer_kstart_flat", None
+        )
+        if _kstart_per_pos is not None:
+            # v1 batch_size=1: kstart_per_pos is the flat per-position
+            # tensor of the single request (length = full_len).
+            _q_pos_dev_i64 = _q_pos.to(_kstart_per_pos.device).long()
+            forward_batch.pic_a3_l2plus_kstart_flat = _kstart_per_pos[
+                _q_pos_dev_i64
+            ].to(dtype=torch.int32, device=device)
+        else:
+            forward_batch.pic_a3_l2plus_kstart_flat = None
+
+        # ── Diagnostic: dump the final per-layer kv_pool state at every
+        # request-slot position (NOT just extend tokens) when
+        # SGLANG_PIC_POOL_DUMP_DIR is set. Runs AFTER all forwards +
+        # writeback so the pool reflects what future attention would read —
+        # for pic modes that includes pub K + delta-RoPE at hit positions,
+        # plus K-override at postchecking layers for pic_a3 / pic_cacheblend.
+        # Runs for ALL modes (including full_recompute) so
+        # test/manual/pic_mode_kv_error_diag.py can do apples-to-apples
+        # cross-mode comparison. Best-effort; capture failure must not break
+        # the request.
+        _dump_dir = os.environ.get("SGLANG_PIC_POOL_DUMP_DIR")
+        if _dump_dir and forward_batch.forward_mode.is_extend():
+            try:
+                from sglang.srt.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+                _rank = get_tensor_model_parallel_rank()
+                # Take the first request only (diagnostic sends bs=1 requests).
+                _req_idx = int(forward_batch.req_pool_indices[0].item())
+                _seq_len = int(forward_batch.seq_lens[0].item())
+                _r2t = self.req_to_token_pool.req_to_token
+                _slots = _r2t[_req_idx, :_seq_len].long()  # (seq_len,) kv_pool slot ids
+                for layer_id in range(self.start_layer, self.end_layer):
+                    _buf = kv_pool.get_key_buffer(layer_id)
+                    _lat = _buf[_slots].detach().to(torch.bfloat16).cpu()
+                    # MLA key buffer is (T, 1, kv_lora_rank+qk_rope_head_dim);
+                    # squeeze the num_kv_heads=1 dim so the .pt is a clean 2D
+                    # (T, kv_dim) and pic_mode_kv_error_diag.py can slice
+                    # directly. Non-MLA backends (already 2D) fall through.
+                    while _lat.ndim > 2:
+                        _squeezed = False
+                        for _d in range(_lat.ndim):
+                            if _lat.shape[_d] == 1:
+                                _lat = _lat.squeeze(_d)
+                                _squeezed = True
+                                break
+                        if not _squeezed:
+                            break
+                    torch.save(
+                        _lat,
+                        os.path.join(
+                            _dump_dir,
+                            f"rank{_rank}_layer{layer_id}_latent.pt",
+                        ),
+                    )
+            except Exception as _e:  # noqa: BLE001
+                import logging as _l
+                _l.getLogger(__name__).warning(
+                    "PIC pool dump failed: %s", _e
+                )
+
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
@@ -3581,10 +5054,114 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     forward_count=split_forward_count,
                 )
             elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                # PIC: pre-populate hit segment private KV slots before the model
+                # forward so that the forward only processes miss segment tokens.
+                self._pic_prepopulate_hit_slots(forward_batch)
+
+                # pic_a3 new-path: model needs handles to model_runner (for
+                # _pic_a3_pick_imp / _pic_a3_rewrite_req_to_token_pool_for_l2plus)
+                # to call from the deepseek_v2 hook. Also expose reqs list via
+                # forward_batch._reqs_ref (already set by ForwardBatch.init_new).
+                _pic_a3_active_this_fwd = getattr(
+                    forward_batch, "pic_a3_new_path", False
+                )
+                _inner_model = None
+                if _pic_a3_active_this_fwd or os.environ.get(
+                    "SGLANG_PIC_KDUMP_DIR", ""
+                ):
+                    # Also expose self when K-dump is on, so the probe can read the
+                    # pools for ANY mode (e.g. full_recompute reference dump).
+                    _inner_model = getattr(self.model, "model", None)
+                    if _inner_model is not None:
+                        _inner_model._pic_a3_model_runner = self
+
                 ret, can_run_graph = self.forward_extend(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+
+                # Clean up the pic_a3 handles after forward (serial forward
+                # so no race). Not strictly required — self is a stable
+                # reference — but keeps the model instance clean.
+                if _inner_model is not None:
+                    _inner_model._pic_a3_model_runner = None
+
+                self._pic_writeback_mla_kv(forward_batch)
+
+                # ── Diagnostic dump (fires for ALL extend modes incl.
+                # full_recompute, unlike the pic_a3-only dump in
+                # _pic_a3_rewrite_req_to_token_pool_for_l2plus). Env-gated by
+                # SGLANG_PIC_POOL_DUMP_DIR. Used by scripts/pic_a3_layer01_error.py
+                # to do cross-mode K comparison. Best-effort; failure must not
+                # break the request.
+                #
+                # Slot selection:
+                # - For pic_a3 at layer 0-1: read from `pic_a3_l01_scratch_flat`
+                #   because pic_a3's layer 0-1 fresh forward wrote K/V to those
+                #   slots. Post-rewrite req_to_token for miss/imp positions
+                #   points at l2plus_miss / l2plus_imp slots which layer 0-1
+                #   never touched (would read zeros → misleading err vs
+                #   full_recompute). l01_scratch has the actual fresh layer 0-1
+                #   K for all full_len positions.
+                # - Otherwise: read via req_to_token (post-rewrite for pic_a3
+                #   layer 2+ reflects the actual runtime K that future
+                #   attention would see).
+                _dump_dir_v2 = os.environ.get("SGLANG_PIC_POOL_DUMP_DIR")
+                if _dump_dir_v2:
+                    try:
+                        from sglang.srt.distributed.parallel_state import (
+                            get_tensor_model_parallel_rank,
+                        )
+                        _rank_v2 = get_tensor_model_parallel_rank()
+                        _req_idx_v2 = int(forward_batch.req_pool_indices[0].item())
+                        _seq_len_v2 = int(forward_batch.seq_lens[0].item())
+                        _r2t_v2 = self.req_to_token_pool.req_to_token
+                        _slots_r2t = _r2t_v2[_req_idx_v2, :_seq_len_v2].long()
+                        # pic_a3 layer 0-1 override slots (may be None for
+                        # non-pic_a3 modes)
+                        _l01_flat = getattr(
+                            forward_batch, "pic_a3_l01_scratch_flat", None
+                        )
+                        _slots_l01 = None
+                        if _l01_flat is not None:
+                            _slots_l01 = _l01_flat[:_seq_len_v2].long().to(
+                                _slots_r2t.device
+                            )
+                        _kv_pool_v2 = self.token_to_kv_pool
+                        _CHECK_LAYER = 1  # pic_a3 layer 0-1 boundary
+                        for _lid_v2 in range(self.start_layer, self.end_layer):
+                            # For pic_a3 layer 0-1: use l01_scratch (actual
+                            # fresh K); else use req_to_token (post-rewrite).
+                            _use_l01 = (
+                                _slots_l01 is not None
+                                and _lid_v2 <= _CHECK_LAYER
+                            )
+                            _slots_v2 = _slots_l01 if _use_l01 else _slots_r2t
+                            _buf_v2 = _kv_pool_v2.get_key_buffer(_lid_v2)
+                            _lat_v2 = (
+                                _buf_v2[_slots_v2].detach().to(torch.bfloat16).cpu()
+                            )
+                            while _lat_v2.ndim > 2:
+                                _sq_v2 = False
+                                for _d_v2 in range(_lat_v2.ndim):
+                                    if _lat_v2.shape[_d_v2] == 1:
+                                        _lat_v2 = _lat_v2.squeeze(_d_v2)
+                                        _sq_v2 = True
+                                        break
+                                if not _sq_v2:
+                                    break
+                            torch.save(
+                                _lat_v2,
+                                os.path.join(
+                                    _dump_dir_v2,
+                                    f"rank{_rank_v2}_layer{_lid_v2}_latent.pt",
+                                ),
+                            )
+                    except Exception as _e_v2:  # noqa: BLE001
+                        import logging as _l_v2
+                        _l_v2.getLogger(__name__).warning(
+                            "PIC pool dump (post-writeback) failed: %s", _e_v2
+                        )
             elif forward_batch.forward_mode.is_idle():
                 ret = self.forward_idle(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors

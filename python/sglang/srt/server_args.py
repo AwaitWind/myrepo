@@ -442,6 +442,15 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
+    # PIC (Position-Independent Cache) -- GLM5.2 segment-level cache
+    pic_enable: bool = False
+    pic_mode: str = "transition_rope"
+    pic_separator_str: str = "<<PIC_SEP>>"
+    # Sink-prefix workaround: prepend N fixed tokens to each segment before
+    # tokenize so those slots absorb the segment-isolated attention sink,
+    # keeping the real content's leading K/V uncontaminated. 0 = disabled.
+    pic_sink_len: int = 0
+    pic_sink_token_id: Optional[int] = None
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
@@ -703,6 +712,22 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
     lmcache_config_file: Optional[str] = None
+
+    # A³ / CacheBlend selective-recompute (GLM5.2 target).
+    # When enabled, requests carrying a precomputed KV cache take the reuse
+    # path in Glm4MoeModel.forward: at layer `check_layer`(=1) important tokens
+    # are selected (A³: Q-K attention top-k; CacheBlend: V-V_old L2 top-k) and
+    # subsequent layers only recompute those tokens, fusing them with the
+    # precomputed KV. Mutually exclusive: pick at most one.
+    enable_a3: bool = False
+    enable_cacheblend: bool = False
+    # Fraction of context tokens to recompute (relative to context_len).
+    recomp_ratio: float = 0.15
+    # A³ research probe: re-select important tokens at MULTIPLE layers instead of
+    # only layer 1. None / [1] == today's single-layer pic_a3 (zero regression).
+    # e.g. [1, 10, 20, 30, 40, 50, 60]. Upper-clamped to num_hidden_layers at the
+    # use site (model config is not loaded during ServerArgs.__post_init__).
+    a3_check_layers: Optional[List[int]] = None
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -5717,6 +5742,44 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--pic-enable",
+            action="store_true",
+            default=ServerArgs.pic_enable,
+            help="Enable PIC (Position-Independent Cache) for GLM5.2 segment-level KV caching.",
+        )
+        parser.add_argument(
+            "--pic-mode",
+            type=str,
+            default=ServerArgs.pic_mode,
+            help="PIC cache mode (default: transition_rope).",
+        )
+        parser.add_argument(
+            "--pic-separator-str",
+            type=str,
+            default=ServerArgs.pic_separator_str,
+            help="Segment separator string for PIC (default: <<PIC_SEP>>).",
+        )
+        parser.add_argument(
+            "--pic-sink-len",
+            type=int,
+            default=ServerArgs.pic_sink_len,
+            help=(
+                "Prepend N fixed 'sink' tokens to each PIC segment before "
+                "tokenize. These slots absorb segment-isolated attention "
+                "sink so the real content's leading K/V stay uncontaminated "
+                "(default: 0 = disabled)."
+            ),
+        )
+        parser.add_argument(
+            "--pic-sink-token-id",
+            type=int,
+            default=ServerArgs.pic_sink_token_id,
+            help=(
+                "Token id to use as the PIC sink prefix. Default None: "
+                "auto-resolve from tokenizer.pad_token_id → bos_token_id → 0."
+            ),
+        )
+        parser.add_argument(
             "--mm-attention-backend",
             type=str,
             choices=[
@@ -6373,6 +6436,46 @@ class ServerArgs:
             type=str,
             default=ServerArgs.lmcache_config_file,
             help="Path to the LMCache YAML configuration file",
+        )
+
+        # A³ / CacheBlend selective-recompute (GLM5.2 target)
+        parser.add_argument(
+            "--enable-a3",
+            action="store_true",
+            help=(
+                "Enable A³ (Attention-Aware Approximate Acceleration) selective "
+                "recompute for GLM5.2. Requires per-request precomputed KV cache."
+            ),
+        )
+        parser.add_argument(
+            "--enable-cacheblend",
+            action="store_true",
+            help=(
+                "Enable CacheBlend selective recompute (V-V_old L2 top-k) for "
+                "GLM5.2. Requires per-request precomputed KV cache."
+            ),
+        )
+        parser.add_argument(
+            "--recomp-ratio",
+            type=float,
+            default=ServerArgs.recomp_ratio,
+            help=(
+                "Recompute ratio for A³/CacheBlend: fraction of context tokens to "
+                "recompute (relative to context_len). Suggested range: 0.05 ~ 0.30."
+            ),
+        )
+        parser.add_argument(
+            "--a3-check-layers",
+            type=int,
+            nargs="+",
+            default=ServerArgs.a3_check_layers,
+            help=(
+                "A³ research probe: layer indices at which to (re)select important "
+                "tokens. Omit or pass a single value (e.g. 1) for today's "
+                "single-layer pic_a3 (zero regression). Pass several (e.g. "
+                "1 10 20 30 40 50 60) to enable multi-layer dynamic re-selection "
+                "(keep-all-alive accuracy-ceiling probe)."
+            ),
         )
 
         # Ktransformer server args
@@ -7404,6 +7507,51 @@ class ServerArgs:
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        # A³ / CacheBlend are mutually exclusive (different top-k strategies).
+        assert not (self.enable_a3 and self.enable_cacheblend), (
+            "--enable-a3 and --enable-cacheblend are mutually exclusive: they "
+            "select important tokens via different signals (Q-K attention vs "
+            "V-V_old L2 diff). Pick one."
+        )
+        if self.enable_a3 or self.enable_cacheblend:
+            assert 0.0 < self.recomp_ratio <= 1.0, (
+                f"--recomp-ratio must be in (0, 1], got {self.recomp_ratio}"
+            )
+            # A³ multi-layer check-layers normalization (research probe). Dedup,
+            # sort ascending, drop <1, force-include layer 1. Upper clamp to
+            # num_hidden_layers happens at the use site (deepseek_v2 layer loop),
+            # where the model config is available. None -> [1] == single-layer.
+            if self.a3_check_layers is None:
+                self.a3_check_layers = [1]
+            else:
+                _cl = sorted({int(x) for x in self.a3_check_layers if int(x) >= 1})
+                self.a3_check_layers = _cl if (_cl and 1 in _cl) else [1] + _cl
+            # PIC + A3/CacheBlend integration (new path): A3 state machine
+            # reads latent_old from the PIC-populated kv_pool at hit positions,
+            # imp_gate lets the PIC K-override skip imp positions so they keep
+            # fresh K/V. Both features co-exist; the mutex is no longer needed.
+            # (Legacy .pt-file A3 path still works alongside PIC — it just
+            # writes precomputed_latent, and the checking layer prefers it
+            # over kv_pool when present.)
+            # Baseline restricts to single-request extend batches with no
+            # overlap / chunked prefill / CP; the reuse state machine is not
+            # yet compatible with any of them. Fail early with an actionable msg.
+            assert self.chunked_prefill_size == -1, (
+                "A3/CacheBlend baseline requires --chunked-prefill-size -1 "
+                f"(got {self.chunked_prefill_size}). Chunked prefill splits the "
+                "prompt across forward calls, but imp_indices is decided from "
+                "the layer-1 attention over the full prompt — they conflict."
+            )
+            assert self.disable_overlap_schedule, (
+                "A3/CacheBlend baseline requires --disable-overlap-schedule. "
+                "The reuse state machine mutates ForwardBatch mid-forward; "
+                "overlap scheduling would race on those fields."
+            )
+            # CUDA graph capture requires stable shapes across replays; imp_len
+            # changes per request, so graph capture is invalid.
+            if not self.disable_cuda_graph:
+                self.disable_cuda_graph = True
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1

@@ -278,10 +278,7 @@ class GroupCoordinator:
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
+            self.device = torch.device(f"cuda:{local_rank}")
         elif _is_npu:
             self.device = torch.device(f"npu:{local_rank}")
         elif _is_xpu:

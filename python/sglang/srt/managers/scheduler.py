@@ -1968,6 +1968,42 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # PIC: transfer segment info from tokenizer to Req
+            if hasattr(recv_req, "pic_segments") and recv_req.pic_segments:
+                req.pic_segments = recv_req.pic_segments
+                # Dispatch tag for the three PIC forward paths (see
+                # PIC_A3_REFACTOR_PLAN.md §零.). Derived from server_args:
+                #   --enable-a3          → pic_a3        (Q·K imp selection)
+                #   --enable-cacheblend  → pic_cacheblend (V-diff imp selection)
+                #   otherwise            → pic            (baseline PIC)
+                sa = self.server_args
+                if getattr(sa, "enable_a3", False):
+                    req.pic_mode = "pic_a3"
+                elif getattr(sa, "enable_cacheblend", False):
+                    req.pic_mode = "pic_cacheblend"
+                else:
+                    req.pic_mode = "pic"
+                # recomp_ratio: the server --recomp-ratio is the source of truth
+                # for pic modes (a per-request payload may still override it in
+                # the block below). BUGFIX: the old code only set req.recomp_ratio
+                # inside `if recv_req.reuse_method is not None`, which pic_a3 never
+                # sends (reuse_method is derived from server flags, not payload) —
+                # so req.recomp_ratio stayed at the 0.15 class default and
+                # --recomp-ratio was silently ignored.
+                req.recomp_ratio = getattr(sa, "recomp_ratio", req.recomp_ratio)
+
+            # A³ / CacheBlend: transfer selective-recompute fields (all default None).
+            if getattr(recv_req, "reuse_method", None) is not None:
+                req.reuse_method = recv_req.reuse_method
+                if recv_req.recomp_ratio is not None:
+                    req.recomp_ratio = recv_req.recomp_ratio
+                if recv_req.reuse_last_len is not None:
+                    req.reuse_last_len = recv_req.reuse_last_len
+                if recv_req.reuse_prefix_len is not None:
+                    req.reuse_prefix_len = recv_req.reuse_prefix_len
+                if recv_req.precomputed_kv_path is not None:
+                    req.precomputed_kv_path = recv_req.precomputed_kv_path
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (

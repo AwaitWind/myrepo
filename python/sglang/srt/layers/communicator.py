@@ -728,6 +728,19 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        # Only pic_a3_oracle (SGLANG_PIC_A3_ORACLE) reads/writes the per-layer
+        # INPUT hidden state (residual stream) at check-layer boundaries, so it
+        # needs the residual stream MATERIALIZED there. This fusion defers the
+        # previous layer's MLP all-reduce into the next layer's input_layernorm,
+        # leaving a pre-all-reduce partial at the boundary — only a problem for
+        # the oracle. Gate strictly on the oracle env so plain pic_a3 /
+        # pic_cacheblend KEEP the fusion (no perf regression); disabling it for
+        # all pic_a3_new_path requests slowed pic_cacheblend.
+        if (
+            getattr(forward_batch, "pic_a3_new_path", False)
+            and envs.SGLANG_PIC_A3_ORACLE.get()
+        ):
+            return False
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at

@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -298,6 +298,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # PIC: public slot index per token position (-1 where no writeback needed).
+    # Set only for PIC transition_rope batches; None otherwise.
+    pic_public_out_loc: Optional[torch.Tensor] = None
+
+    # PIC: hit-segment delta-RoPE metadata for forward_absorb_prepare fallback.
+    pic_hit_pub_kv_loc: Optional[torch.Tensor] = None
+    pic_hit_delta_pos: Optional[torch.Tensor] = None
+
+    # PIC: flat hit-slot tensors for _pic_prepopulate_hit_slots in model_runner.
+    # All hit segments across all requests concatenated:
+    #   pic_all_hit_pub_slots[i]:  public KV slot for hit token i
+    #   pic_all_hit_priv_slots[i]: private KV slot for hit token i
+    #   pic_all_hit_delta_pos[i]:  delta = new_start - old_start
+    pic_all_hit_pub_slots: Optional[torch.Tensor] = None
+    pic_all_hit_priv_slots: Optional[torch.Tensor] = None
+    pic_all_hit_delta_pos: Optional[torch.Tensor] = None
+    # pic_mode: dispatch tag propagated from Req/ScheduleBatch.
+    # Values: None | "pic" | "pic_a3" | "pic_cacheblend".
+    # pic_a3 / pic_cacheblend currently share the plain-pic code path — the
+    # mode string is preserved for scheduler dispatch and CLI compatibility
+    # (`--enable-a3` / `--enable-cacheblend`) but selects no distinct behavior.
+    pic_mode: Optional[str] = None
+
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
     # they are cloned/relayed into FB-owned copies at the boundary, move them out of
@@ -460,6 +483,118 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+
+    # ===== A³ / CacheBlend selective-recompute (GLM5.2 target) =====
+    # Static configuration copied from Req at ForwardBatch construction time.
+    #   None            -> feature fully disabled (zero-overhead default path)
+    #   'debug'         -> A³           (query-key attention top-k)
+    #   'blend'         -> CacheBlend   (value L2 top-k)
+    reuse_method: Optional[str] = None
+    recomp_ratio: float = 0.15
+    # Number of new query tokens at the tail (always recomputed).
+    reuse_last_len: Optional[int] = None
+    # System prompt length (skipped in top-k selection).
+    reuse_prefix_len: int = 0
+    # Precomputed KV for the MHA (glm4_moe) A³/CacheBlend standalone path:
+    # a single tensor of shape (2, num_layers, num_kv_heads_per_tp, total_len, head_dim).
+    precomputed_kv: Optional[Any] = None
+    # Dynamic state filled during model forward (MHA path — glm4_moe):
+    reuse_org_positions: Optional[torch.Tensor] = None  # (total_len,)
+    reuse_imp_indices: Optional[torch.Tensor] = None  # (imp_len,)
+    reuse_fake_q: Optional[torch.Tensor] = None
+    reuse_check_state: Optional[str] = None  # None / 'checking' / 'postchecking'
+    # Current layer's precomputed KV slice (2, kv_heads_per_tp, total_len, head_dim).
+    reuse_cat_kv_cur_layer: Optional[torch.Tensor] = None
+    # Cached QKV between forward_prepare and forward_core when reuse is active.
+    reuse_qkv_checking: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+    # === PIC + A³/CacheBlend "new path" (no .pt precomputed_kv) ===
+    # See scripts/pic_a3_full_recompute_plan.md.
+    # When set to True, glm4_moe's reuse state machine sources v_old/key_old
+    # from PICache public slots (via read_hit_kv_from_pic_public) instead of
+    # from forward_batch.precomputed_kv. Also gates the schedule_batch
+    # full-len-input behavior and pic_alloc scratch-slot allocation.
+    pic_a3_new_path: bool = False
+    # Per-position mask of hit vs non-hit tokens, aligned with input_ids
+    # (length = extend_num_tokens = full_len for pic_a3 new path).
+    # True at index i iff token i is a hit token (KV comes from PICache
+    # public slot). Set by pic_alloc when new-path is active.
+    pic_a3_is_hit_mask: Optional[torch.Tensor] = None
+    # Per-position public slot index, aligned with input_ids. -1 for miss
+    # tokens (which don't have a public slot). Used by read_hit_kv_from_pic_public
+    # to look up hit KV from the kv_pool buffer.
+    pic_a3_hit_pub_slots: Optional[torch.Tensor] = None
+    # Per-token attention k_start (segment-isolated causal).
+    # int32, shape [extend_num_tokens] (aligned with input_ids).
+    # Populated for ANY pic mode (pic / pic_a3 / pic_cacheblend) whenever the
+    # request has pic_segments. For Q token i (index into input_ids):
+    #   - true position P = i (pic_a3 new-path, input_ids covers full seq)
+    #     OR miss_positions[i] (pic legacy, input_ids covers miss only)
+    #   - Q's attention window is [k_start[i], P+1).
+    #   - Non-last segment position → k_start[i] = segment_start (segment-isolated,
+    #     doesn't see SYS or any other segment).
+    #   - Last segment (query region) → k_start[i] = 0 (sees everything).
+    # Consumed by dsa_backend._cal_indexer_k_start_end / init_forward_metadata.
+    # None outside pic modes.
+    pic_layer_kstart_flat: Optional[torch.Tensor] = None
+
+    # === PIC + A³/CacheBlend "new path" — L01 scratch + L2+ metadata ===
+    # See scripts/pic_a3_full_recompute_plan.md §3.3 §3.6 §3.7.5.
+    # Flat concat of layer-0-1 scratch slots across all requests in batch.
+    # Freed proactively at layer 2 boundary (§3.6 hook, v1 mandatory).
+    pic_a3_l01_scratch_flat: Optional[torch.Tensor] = None
+    # Row indices into full-length hidden_states that survive the layer-1 clip
+    # to (miss + imp). Length = miss_len + imp_len. Ascending position order.
+    pic_a3_l2plus_row_indices: Optional[torch.Tensor] = None
+    # out_cache_loc rewritten for layer 2+ (points to l2plus_miss + l2plus_imp
+    # slots at their sequence positions). Length matches pic_a3_l2plus_row_indices.
+    pic_a3_l2plus_out_cache_loc: Optional[torch.Tensor] = None
+    # pic_public_out_loc rewritten for layer 2+. Same length. Miss positions
+    # get their pub-slot index (writeback happens); imp positions get -1
+    # (no writeback — imp KV is discarded after forward).
+    pic_a3_l2plus_pub_out_loc: Optional[torch.Tensor] = None
+    # Per-request Q positions for layer 2+ (miss ∪ imp, sorted ascending),
+    # consumed by dsa_backend._cal_indexer_k_start_end pic_a3 branch and by
+    # init_forward_metadata's pic_a3 postchecking branch (seqlens_expanded rebuild).
+    pic_a3_q_positions_l2plus_per_req: Optional[List[torch.Tensor]] = None
+    # Per-Q-token attention k_start for layer 2+ (segment-isolated causal).
+    # int32, shape [_new_qlen = miss_len + imp_len]. Aligned with
+    # pic_a3_l2plus_row_indices ordering. For imp Q at position p in hit
+    # segment [s, e): k_start[i] = s (segment-isolated). For miss Q in the
+    # last (query) segment: k_start[i] = 0 (sees everything). Built by the
+    # layer 1 boundary hook by gathering pic_layer_kstart_flat at
+    # pic_a3_l2plus_row_indices. Consumed by dsa_backend postchecking
+    # branches in _cal_indexer_k_start_end / init_forward_metadata.
+    pic_a3_l2plus_kstart_flat: Optional[torch.Tensor] = None
+    # Layer-1 attention tensors stashed by forward_mla for imp selection.
+    # dict with keys: q_absorbed / k_latent / q_pe / k_pe / softmax_scale /
+    # kv_lora_rank / layer_id. Set at CHECK_LAYER by forward_absorb_prepare;
+    # consumed by the deepseek_v2 hook right after the layer 1 forward returns.
+    pic_a3_layer1_stash: Optional[Dict[str, Any]] = None
+    # A³ multi-layer research probe (server_args.a3_check_layers). Layers at which
+    # imp is (re)selected; default (1,) == today's single-layer pic_a3. Set by
+    # _maybe_populate_reuse_fields; upper-clamped to num_hidden_layers at use site.
+    a3_check_layers: tuple = (1,)
+    # True iff len(a3_check_layers) > 1: enables the keep-all-alive dynamic
+    # multi-layer re-selection path (accuracy-ceiling probe) in deepseek_v2.
+    pic_a3_multiselect: bool = False
+    # Per-check-layer stash of latent Q/K for imp selection, keyed by layer_id
+    # (generalizes pic_a3_layer1_stash). Filled by forward_absorb_prepare.
+    pic_a3_stash_by_layer: Optional[Dict[int, Any]] = None
+    # pic_a3_oracle Route-A: per-forward stash of the LAST (query) segment's
+    # residual stream (hidden+residual) captured at each check layer. The query
+    # segment is never oracle-captured (it has no isolated warmup pass), so the
+    # clip-time full-length re-projection (_pic_a3_oracle_reselect_full) reads the
+    # query rows from here. Set in _pic_a3_oracle_capture_or_inject; per-forward.
+    _pic_a3_last_seg_rs: Optional[torch.Tensor] = None
+    # imp_indices produced at the layer-1 boundary by _pic_a3_pick_imp;
+    # consumed by _pic_a3_rewrite_req_to_token_pool_for_l2plus and by the
+    # tensor clip logic in the deepseek_v2 hook. Flat per-batch (single-req
+    # in v1) tensor of positions selected as important.
+    pic_a3_imp_indices: Optional[torch.Tensor] = None
+    # Handle to ScheduleBatch.reqs list (for the pic_a3 hook to read per-req
+    # attrs like pic_a3_l2plus_miss_slots). Reference, not copy.
+    _reqs_ref: Optional[List[Any]] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -629,6 +764,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            pic_public_out_loc=getattr(batch, "pic_public_out_loc", None),
+            pic_hit_pub_kv_loc=getattr(batch, "pic_hit_pub_kv_loc", None),
+            pic_hit_delta_pos=getattr(batch, "pic_hit_delta_pos", None),
+            pic_all_hit_pub_slots=getattr(batch, "pic_all_hit_pub_slots", None),
+            pic_all_hit_priv_slots=getattr(batch, "pic_all_hit_priv_slots", None),
+            pic_all_hit_delta_pos=getattr(batch, "pic_all_hit_delta_pos", None),
+            # pic_a3 new-path per-position tensors (from pic_alloc, see
+            # scripts/pic_a3_full_recompute_plan.md §3.3 / §3.9)
+            pic_a3_is_hit_mask=getattr(batch, "pic_a3_is_hit_mask", None),
+            pic_a3_hit_pub_slots=getattr(batch, "pic_a3_hit_pub_slots", None),
+            pic_a3_l01_scratch_flat=getattr(batch, "pic_a3_l01_scratch_flat", None),
+            # Segment-isolated attention kstart (all pic modes; input_ids-aligned).
+            pic_layer_kstart_flat=getattr(batch, "pic_layer_kstart_flat", None),
+            # pic_a3 needs a handle to the reqs list for per-req attrs
+            # (pic_a3_l2plus_miss_slots, pic_a3_l2plus_imp_slots_pool, etc.)
+            # in the layer-2 hook. Stored as a *reference*, not a copy —
+            # forward is serial so this is safe.
+            _reqs_ref=getattr(batch, "reqs", None),
+            # pic_mode lives on Req (set in scheduler.handle_generate_request),
+            # not on ScheduleBatch. All reqs in a batch share the same mode
+            # in the single-request-per-batch A3 baseline, so read from reqs[0].
+            pic_mode=(
+                getattr(batch.reqs[0], "pic_mode", None)
+                if getattr(batch, "reqs", None)
+                else None
+            ),
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
@@ -781,6 +942,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
+            # Legacy PIC (miss-only input_ids): override positions with actual
+            # miss-token sequence positions so RoPE is applied at the correct
+            # (non-contiguous) positions.
+            # pic_a3 new-path (full-len input_ids including hit+miss): positions
+            # cover the WHOLE sequence, not just miss. Skip this override —
+            # pic_alloc filled input_ids in position order so `positions` from
+            # compute_position (contiguous 0..full_len-1) is already correct.
+            _pic_miss_pos = getattr(batch, "pic_miss_positions", None)
+            _pic_a3_full_len_input = (
+                getattr(batch, "pic_a3_is_hit_mask", None) is not None
+            )
+            if _pic_miss_pos is not None and not _pic_a3_full_len_input:
+                ret.positions = _pic_miss_pos
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:
@@ -803,6 +977,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        # ── A³ / CacheBlend: hoist per-req reuse config onto ForwardBatch ──
+        # Baseline restricts to single-request extend batches. Silent no-op otherwise.
+        _maybe_populate_reuse_fields(ret, batch, model_runner)
 
         return ret
 
@@ -1200,6 +1378,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.pic_public_out_loc is not None:
+            self.pic_public_out_loc = self._pad_tensor_to_size(
+                self.pic_public_out_loc, num_tokens, value=-1
+            )
+        # Note: pic_all_hit_{pub,priv,delta} slots are indexed by hit token count
+        # (not num_tokens) and are consumed only in _pic_prepopulate_hit_slots
+        # which runs before the model forward using original unpadded lengths.
+        # No padding needed for them here.
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
@@ -1473,3 +1659,102 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def _maybe_populate_reuse_fields(
+    fb: ForwardBatch,
+    batch: ScheduleBatch,
+    model_runner: ModelRunner,
+) -> None:
+    """Populate A³ / CacheBlend reuse config on ForwardBatch from Req.
+
+    Baseline supports single-request extend batches only; non-matching
+    combinations are silently ignored so the default path stays unchanged.
+    """
+    sa = model_runner.server_args
+    if not (getattr(sa, "enable_a3", False) or getattr(sa, "enable_cacheblend", False)):
+        return
+    if len(batch.reqs) != 1:
+        return
+    if not batch.forward_mode.is_extend():
+        return
+
+    req = batch.reqs[0]
+    reuse_method = getattr(req, "reuse_method", None)
+    if reuse_method is None:
+        # Fall back to server-arg default when the request didn't specify.
+        if sa.enable_a3:
+            reuse_method = "debug"
+        elif sa.enable_cacheblend:
+            reuse_method = "blend"
+        else:
+            return
+
+    device = None
+    if fb.input_ids is not None:
+        device = fb.input_ids.device
+    elif fb.positions is not None:
+        device = fb.positions.device
+    else:
+        device = torch.device("cuda")
+
+    # Multi-TP: pass the local TP rank so precomputed_kv_path templates like
+    # "/tmp/kv/rank{rank}.pt" resolve to the per-rank shard.
+    _tp_rank = getattr(model_runner, "tp_rank", 0) or 0
+    precomputed_kv = req.get_precomputed_kv(device=str(device), tp_rank=_tp_rank)
+    # PIC hit path: skip the precomputed_kv requirement when the request has
+    # PIC-hit tokens. latent_old will be read from kv_pool at the checking
+    # layer (PIC pre-populated it). This lets --enable-a3 / --enable-cacheblend
+    # operate on top of PIC hits without any .pt file.
+    _has_pic_hit = getattr(batch, "pic_hit_pub_kv_loc", None) is not None
+    if precomputed_kv is None and not _has_pic_hit:
+        return
+
+    fb.reuse_method = reuse_method
+    fb.recomp_ratio = req.recomp_ratio or sa.recomp_ratio
+    # last_len defaults to the LAST-SEGMENT length (query region convention in
+    # PIC: the last segment is always the query/generation region and is never
+    # cached — see pic_alloc.py). A³'s last_len is "query region always kept
+    # as imp", not "all miss tokens" — using all-miss would incorrectly treat
+    # hit-region tail like C3 as query and skew imp selection.
+    _default_last_len = None
+    _pic_segs = getattr(req, "pic_segments", None)
+    if req.reuse_last_len is None and _pic_segs:
+        _last_seg = _pic_segs[-1]  # (start, end) tuple
+        _default_last_len = int(_last_seg[1] - _last_seg[0])
+    elif req.reuse_last_len is None and getattr(batch, "pic_miss_positions", None) is not None:
+        # Non-PIC fallback: use miss count (legacy path — should rarely fire
+        # for pic_a3 since new-path requires pic_hit_segments non-empty)
+        _default_last_len = int(batch.pic_miss_positions.numel())
+    fb.reuse_last_len = req.reuse_last_len if req.reuse_last_len is not None else _default_last_len
+    fb.reuse_prefix_len = req.reuse_prefix_len or 0
+    fb.precomputed_kv = precomputed_kv
+
+    # New PIC + A³ path (no .pt): activated when precomputed_kv is None AND
+    # pic_alloc actually took the pic_a3 new-path branch (which is when
+    # batch.pic_a3_is_hit_mask is populated — set by pic_alloc.py under
+    # _is_pic_a3_new_path_req, which requires ACTUAL hit segments not just
+    # the pic_hit_pub_kv_loc tensor existence).
+    #
+    # NB: `_has_pic_hit` (above) is True even for all-miss warmup requests
+    # because pic_hit_pub_kv_loc is always populated for PIC batches (with
+    # -1 sentinels for miss tokens). We need a stronger signal to decide if
+    # the pic_a3 new-path scaffolding (l01_scratch / l2plus slots / etc.)
+    # was actually allocated. pic_a3_is_hit_mask is that signal — it's only
+    # non-None when pic_alloc._is_pic_a3_new_path_req returned True.
+    _pic_a3_new_path_allocated = (
+        getattr(batch, "pic_a3_is_hit_mask", None) is not None
+    )
+    if precomputed_kv is None and _pic_a3_new_path_allocated:
+        fb.pic_a3_new_path = True
+        fb.pic_a3_is_hit_mask = batch.pic_a3_is_hit_mask
+        fb.pic_a3_hit_pub_slots = getattr(batch, "pic_a3_hit_pub_slots", None)
+        # A³ multi-layer research probe: thread check-layers onto the batch.
+        # Default (1,) == single-layer pic_a3. >1 layer => multiselect probe.
+        _a3_layers = getattr(sa, "a3_check_layers", None) or [1]
+        fb.a3_check_layers = tuple(int(x) for x in _a3_layers)
+        fb.pic_a3_multiselect = len(fb.a3_check_layers) > 1
+        fb.pic_a3_stash_by_layer = {}
+        # NOTE: fb.pic_layer_kstart_flat is populated in ForwardBatch.init_new
+        # so it also propagates for pic legacy (which doesn't hit this
+        # a3/cacheblend-gated helper). No need to re-copy here.

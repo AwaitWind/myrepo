@@ -52,7 +52,6 @@ from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     configure_logger,
     kill_itself_when_parent_died,
-    maybe_reindex_device_id,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -562,7 +561,7 @@ class DataParallelController:
                     )
                 )
 
-                with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                with self.env_lock:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
                         args=(

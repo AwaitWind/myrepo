@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -580,21 +581,63 @@ class DeepseekSparseAttnBackend(
             assert forward_batch.extend_seq_lens is not None
             extend_seq_lens = forward_batch.extend_seq_lens
 
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        forward_batch.extend_seq_lens_cpu,
-                        forward_batch.seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
+            # === ragkv-style full causal for pic scattered Q ===
+            # For pic legacy / pic_a3 layer 0-1 / pic_a3 layer 2+ postchecking:
+            # Q is scattered across absolute positions (miss ∪ imp). We give
+            # each Q token a per-token causal window [0, p+1] where p is its
+            # ABSOLUTE position — matches ragkv's `create_flashinfer_mask`
+            # (models/reuse_utils.py:117: `custom_mask[i, :index+1] = True`).
+            # This is stricter than the else branch's tail assumption
+            # (which would let early scattered Q see the future).
+            #
+            # kstart is forced to 0 (K pool start) for all pic Q, unlike the
+            # old segment-isolated variant that used per-segment kstart.
+            _is_pic_a3_l2plus = (
+                getattr(forward_batch, "pic_a3_new_path", False)
+                and getattr(forward_batch, "reuse_check_state", None) == "postchecking"
             )
+            _is_pic_seg = (
+                not _is_pic_a3_l2plus
+                and getattr(forward_batch, "pic_a3_l2plus_row_indices", None) is None
+                and getattr(forward_batch, "pic_layer_kstart_flat", None) is not None
+            )
+            if _is_pic_a3_l2plus:
+                q_pos_per_req = forward_batch.pic_a3_q_positions_l2plus_per_req
+                assert q_pos_per_req is not None and len(q_pos_per_req) == batch_size, (
+                    f"pic_a3 postchecking: expected "
+                    f"pic_a3_q_positions_l2plus_per_req with {batch_size} entries, "
+                    f"got {None if q_pos_per_req is None else len(q_pos_per_req)}"
+                )
+                # ragkv: seqlens_expanded[i] = p_i + 1 (window length = position + 1)
+                _pieces = []
+                for i in range(batch_size):
+                    q_pos_i = q_pos_per_req[i].to(dtype=torch.int32, device=device)
+                    _pieces.append(q_pos_i + 1)
+                seqlens_expanded = torch.cat(_pieces)
+            elif _is_pic_seg:
+                # positions comes from forward_batch.positions (pic legacy →
+                # pic_miss_positions, pic_a3 layer 0-1 → contiguous 0..full_len-1).
+                # ragkv-style: window length per Q = position + 1 (kstart=0).
+                _positions_flat = forward_batch.positions.to(
+                    dtype=torch.int32, device=device
+                )
+                seqlens_expanded = _positions_flat + 1
+            else:
+                seqlens_expanded = torch.cat(
+                    [
+                        torch.arange(
+                            kv_len - qo_len + 1,
+                            kv_len + 1,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        for qo_len, kv_len in zip(
+                            forward_batch.extend_seq_lens_cpu,
+                            forward_batch.seq_lens_cpu.tolist(),
+                            strict=True,
+                        )
+                    ]
+                )
 
             if can_dsa_prefill_cp_round_robin_split(forward_batch):
                 seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
@@ -775,23 +818,71 @@ class DeepseekSparseAttnBackend(
             forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
+
+        # === ragkv-style full causal for pic scattered Q ===
+        # See init_forward_metadata for rationale. ks always = k_offset (start
+        # of this request's K pool), ke = k_offset + true_pos + 1 (window is
+        # [0, position+1] in absolute coords). Handles scattered Q correctly
+        # for pic_a3 layer 2+ postchecking and pic legacy miss set.
+        _is_pic_a3_l2plus = (
+            getattr(forward_batch, "pic_a3_new_path", False)
+            and getattr(forward_batch, "reuse_check_state", None) == "postchecking"
+        )
+        _q_pos_per_req = (
+            forward_batch.pic_a3_q_positions_l2plus_per_req
+            if _is_pic_a3_l2plus else None
+        )
+        _is_pic_seg = (
+            not _is_pic_a3_l2plus
+            and getattr(forward_batch, "pic_a3_l2plus_row_indices", None) is None
+            and getattr(forward_batch, "pic_layer_kstart_flat", None) is not None
+        )
+        _positions_flat = (
+            forward_batch.positions.to(dtype=torch.int32, device=self.device)
+            if _is_pic_seg else None
+        )
+        _seg_cursor = 0
+
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
             assert isinstance(seq_len, int)
-            extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
-            ks = torch.full(
-                (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
-            )
             kv_len = seq_len
             if forward_batch.forward_mode.is_target_verify():
                 kv_len += self.speculative_num_draft_tokens
-            seq_lens_expanded = torch.arange(
-                kv_len - extend_seq_len + 1,
-                kv_len + 1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            ke = ks + seq_lens_expanded
+
+            if _is_pic_a3_l2plus:
+                q_pos_i = _q_pos_per_req[i].to(dtype=torch.int32, device=self.device)
+                q_len_i = int(q_pos_i.numel())
+                # ragkv: ks = k_offset (K pool start), ke = k_offset + p + 1
+                ks = torch.full(
+                    (q_len_i,), k_offset, dtype=torch.int32, device=self.device
+                )
+                ke = k_offset + (q_pos_i + 1)
+                extend_seq_len = q_len_i
+            elif _is_pic_seg:
+                extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
+                _true_pos_i = _positions_flat[
+                    _seg_cursor : _seg_cursor + extend_seq_len
+                ]
+                # ragkv: ks = k_offset for all Q; ke = k_offset + true_pos + 1
+                ks = torch.full(
+                    (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
+                )
+                ke = k_offset + (_true_pos_i + 1)
+                _seg_cursor += extend_seq_len
+            else:
+                extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
+                ks = torch.full(
+                    (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
+                )
+                seq_lens_expanded = torch.arange(
+                    kv_len - extend_seq_len + 1,
+                    kv_len + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                ke = ks + seq_lens_expanded
+
             ks_list.append(ks)
             ke_list.append(ke)
 
@@ -804,7 +895,7 @@ class DeepseekSparseAttnBackend(
 
             if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
                 q_offset += extend_seq_len
-                k_offset += seq_len
+                k_offset += seq_len   # ← K pool advances by full seq_len (§3.7 不变式 C)
 
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
@@ -2248,6 +2339,28 @@ class DeepseekSparseAttnBackend(
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
+    def reset_and_init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Rebuild forward_metadata mid-forward (pic_a3 postchecking use only).
+
+        See scripts/pic_a3_full_recompute_plan.md §3.7.5.
+
+        Preconditions (caller = deepseek_v2 hook, §3.6):
+        - forward_batch.extend_num_tokens / extend_seq_lens / extend_seq_lens_cpu
+          already updated to new (miss+imp) shape.
+        - forward_batch.out_cache_loc already swapped to pic_a3_l2plus_out_cache_loc.
+        - forward_batch.seq_lens / seq_lens_cpu UNCHANGED (K pool full-len — invariant C).
+        - forward_batch.pic_a3_q_positions_l2plus_per_req populated.
+        - forward_batch.reuse_check_state == "postchecking".
+
+        Field name reminder: the backend's own metadata field is
+        self.forward_metadata (not self.attn_metadata — that's on
+        DSAIndexerMetadata, a different class; see plan §3.7.5).
+        """
+        self.forward_metadata = None
+        # Re-plan; the is_extend branch's pic_a3 sub-branch (§3.7.5 必改点 2,
+        # right above) handles the scattered-Q metadata construction.
+        self.init_forward_metadata(forward_batch)
+
     def set_dsa_prefill_impl(self, forward_batch: Optional[ForwardBatch] = None):
         """
         Decide all attention prefill dispatch strategies for this batch.
@@ -2270,6 +2383,29 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
+            # PIC (baseline `pic` mode only) pre-populates hit-segment K/V into
+            # pool slots via `_pic_prepopulate_hit_slots` and DOES NOT run those
+            # tokens through the current forward — only miss tokens go through.
+            # The MHA_ONE_SHOT path on SM90 uses FA3 `flash_attn_varlen_func`
+            # after fetching the *full* prefix K/V via
+            # `fetch_mha_one_shot_kv_indices` → `_get_mla_kv_buffer` →
+            # `kv_b_proj`. When the prefix K/V comes purely from PIC-populated
+            # slots (never touched by the current forward), that FA3 launch
+            # hits CUDA_ERROR_ILLEGAL_INSTRUCTION on SM90. Route those batches
+            # through `flashmla_sparse` instead. Diagnostic:
+            # `/tmp/sglang_quick_test_30001_pic.log`, search
+            # `flash_fwd_launch_template.h:201`.
+            #
+            # `pic_a3` / `pic_cacheblend` are the same story under IMP_ONLY:
+            # only imp tokens are in the forward, so hit-position K comes
+            # entirely from `_pic_prepopulate_hit_slots`. Force sparse.
+            _pic_mode = getattr(forward_batch, "pic_mode", None)
+            has_pic_prepopulated_no_fresh_writeback = (
+                _pic_mode in ("pic", "pic_a3", "pic_cacheblend")
+                and getattr(forward_batch, "pic_all_hit_pub_slots", None) is not None
+                and forward_batch.pic_all_hit_pub_slots.numel() > 0
+            )
+
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
@@ -2282,6 +2418,7 @@ class DeepseekSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
                 and (self.hisparse_coordinator is None)
+                and (not has_pic_prepopulated_no_fresh_writeback)
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA

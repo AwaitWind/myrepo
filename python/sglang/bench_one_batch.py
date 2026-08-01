@@ -83,7 +83,6 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
-    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -962,19 +961,18 @@ def main(server_args, bench_args):
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
-            with maybe_reindex_device_id(tp_rank) as gpu_id:
-                proc = multiprocessing.Process(
-                    target=work_func,
-                    args=(
-                        server_args,
-                        port_args,
-                        bench_args,
-                        gpu_id,
-                        tp_rank,
-                    ),
-                )
-                proc.start()
-                workers.append(proc)
+            proc = multiprocessing.Process(
+                target=work_func,
+                args=(
+                    server_args,
+                    port_args,
+                    bench_args,
+                    tp_rank,
+                    tp_rank,
+                ),
+            )
+            proc.start()
+            workers.append(proc)
 
         for proc in workers:
             proc.join()

@@ -1,0 +1,7 @@
+ultralytics>=8.3
+pillow>=10
+numpy>=1.26
+# OCR 后端二选一，只有 text_det/pseudo_label.py 需要，且必须在能联网的机器上装。
+# PaddleOCR 的权重站 bj.bcebos.com 在部分网络下不可达，此时改用 easyocr。
+# paddleocr>=2.7
+# easyocr>=1.7

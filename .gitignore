@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# Raw dataset folders (tracked as compressed archives instead)
+/200_train_cases/
+/data/
+
+# Full data tarball (tracked as split volumes data.tar.gz.*.part)
+/data.tar.gz

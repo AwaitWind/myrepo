@@ -39,9 +39,18 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 class Paddle3(eng._Base):
-    """PaddleOCR 3.x。关掉文档方向/矫正子模型 —— 对原理图裁剪块无用，
-    但默认开启会多下载三个模型、显著拖慢首次启动。
-    2.x 不认这些参数，会 TypeError，此时逐个剔除后重试。
+    """PaddleOCR 3.x。两处非默认设置:
+
+    1. 关掉文档方向/矫正子模型 —— 对原理图裁剪块无用，
+       但默认开启会多下载三个模型、显著拖慢首次启动。
+    2. 默认关掉 oneDNN(mkldnn)。paddlepaddle 3.3.1 的 oneDNN 后端在跑文本检测时
+       会崩在 `ConvertPirAttribute2RuntimeAttribute not support
+       [pir::ArrayAttribute<pir::DoubleAttribute>]`（onednn_instruction.cc:116），
+       某个属性类型的 PIR 转换尚未实现。关掉它走通用 CPU 算子即可绕过，
+       代价是 CPU 推理变慢。确认自己的 paddle 版本没这个 bug 可以加 --mkldnn 开回来。
+
+    老版本不认这些参数：PaddleOCR 自身抛 TypeError，通用参数走 paddleocr 的
+    parse_common_args 校验、抛的是 ValueError，两种都要接。
     """
 
     name = "paddleocr"
@@ -51,10 +60,15 @@ class Paddle3(eng._Base):
         "use_textline_orientation": False,
     }
 
-    def __init__(self, lang="en", model_dir=None):
+    def __init__(self, lang="en", model_dir=None, mkldnn=False, device=None):
         from paddleocr import PaddleOCR
 
         kw = {"lang": lang, **self._OFF}
+        if device:
+            kw["device"] = device
+        # oneDNN 是 CPU 专用加速库，GPU 上这条开关无意义，就不传了
+        if not mkldnn and not (device or "").startswith("gpu"):
+            kw["enable_mkldnn"] = False
         if model_dir:
             det, rec = os.path.join(model_dir, "det"), os.path.join(model_dir, "rec")
             if os.path.isdir(det):
@@ -65,7 +79,7 @@ class Paddle3(eng._Base):
             try:
                 self.ocr = PaddleOCR(**kw)
                 break
-            except TypeError as err:
+            except (TypeError, ValueError) as err:
                 drop = next((k for k in list(kw) if k != "lang" and k in str(err)), None)
                 if drop is None:
                     raise
@@ -94,14 +108,18 @@ class Paddle3(eng._Base):
         return best
 
 
-def build_backend(name: str, lang: str, model_dir: str | None, gpu: bool):
+def build_backend(name: str, lang: str, model_dir: str | None, gpu: bool,
+                  mkldnn: bool = False):
     if name == "paddleocr":
         try:
-            return Paddle3(lang=lang, model_dir=model_dir)
+            return Paddle3(lang=lang, model_dir=model_dir, mkldnn=mkldnn,
+                           device="gpu" if gpu else None)
         except ImportError as err:
             raise SystemExit(
                 f"paddleocr 不可用: {err}\n"
-                "  安装: pip install paddlepaddle paddleocr   （别装 -gpu 版，会和 torch 的 CUDA 打架）\n"
+                "  两个包都要装: pip install paddlepaddle paddleocr\n"
+                "  （paddleocr 的依赖里不含 paddlepaddle，必须单独装；"
+                "GPU 版是 paddlepaddle-gpu，注意它可能和 torch 的 CUDA 打架）\n"
                 "  只想验证管道接线: --backend stub"
             ) from err
     return eng.build(name, lang, model_dir, gpu)
@@ -155,7 +173,12 @@ def main():
     ap.add_argument("--lang", default="en",
                     help="原理图文本基本是 ASCII，用 en 比 ch 更准也更快")
     ap.add_argument("--ocr-model-dir", default=None, help="预下载的模型目录，离线机用")
-    ap.add_argument("--gpu", action="store_true")
+    ap.add_argument("--gpu", action="store_true",
+                    help="用 GPU 推理。需要 paddlepaddle-gpu；GPU 上不走 oneDNN，"
+                         "所以也顺带绕开了那个 crash")
+    ap.add_argument("--mkldnn", action="store_true",
+                    help="开回 oneDNN 加速。默认关闭 —— paddlepaddle 3.3.1 的 oneDNN "
+                         "后端跑文本检测会崩在 ConvertPirAttribute2RuntimeAttribute")
     ap.add_argument("--window", type=int, default=640)
     ap.add_argument("--overlap", type=float, default=0.2)
     ap.add_argument("--conf", type=float, default=0.25, help="YOLO 框的置信度下限")
@@ -174,7 +197,7 @@ def main():
         img = np.asarray(raw.convert("RGB"))
     print(f"[ocr] 图片 {a.image}  {W}x{H}  模式 {a.boxes}  后端 {a.backend}")
 
-    backend = build_backend(a.backend, a.lang, a.ocr_model_dir, a.gpu)
+    backend = build_backend(a.backend, a.lang, a.ocr_model_dir, a.gpu, a.mkldnn)
 
     items = []
     if a.boxes == "whole":
